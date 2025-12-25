@@ -1,0 +1,4 @@
+n_genes: 18894
+n_tfs: 1480
+binding_sparsity: 0.9393014441879161
+tf_tf_edges: 173536

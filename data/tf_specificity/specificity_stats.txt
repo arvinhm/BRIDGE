@@ -1,0 +1,13 @@
+Total TFs: 1480
+JASPAR entries: 2059
+JASPAR matched: 535
+Match rate: 36.1%
+Weight range: [0.970, 1.270]
+Weight mean: 1.152
+Weight std: 0.037
+
+Matched TFs weight: mean=1.150, std=0.045
+Unmatched TFs weight: mean=1.153, std=0.031
+
+NOTE: Unmatched TFs are NOT penalized - they use median IC from matched TFs.
+      Weighting is primarily based on binding sparsity (fewer targets = higher weight).

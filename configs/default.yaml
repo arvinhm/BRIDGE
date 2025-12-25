@@ -1,0 +1,89 @@
+# SingleCell-GRN Default Configuration
+# ====================================
+
+# Model Architecture
+model:
+  name: "MonsterGRN"
+  hidden_dim: 512
+  n_heads: 8
+  n_layers: 4
+  dropout: 0.1
+  use_gcn: true
+  use_transformer: true
+  use_sequence_encoder: false  # Set true if DNA sequences available
+
+# TF Encoder
+tf_encoder:
+  embedding_dim: 256
+  n_gcn_layers: 2
+  use_chip_atlas: true
+  chip_atlas_threshold: 0.1
+
+# Cell Encoder
+cell_encoder:
+  use_linger_style: true
+  per_gene_hidden: [64, 16]
+  use_shared_encoder: true
+
+# Sequence Encoder (optional - requires DNA sequences)
+sequence_encoder:
+  promoter_length: 2000
+  kernel_sizes: [4, 8, 16]
+  n_filters: 64
+  use_enhancer: false
+
+# Training
+training:
+  epochs: 100
+  batch_size: 64
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  lr_scheduler: "cosine"  # cosine, onecycle, step
+  warmup_epochs: 5
+  early_stopping: 15
+  gradient_clip: 1.0
+  
+# Loss Weights
+loss:
+  reconstruction: 0.5
+  perturbation: 1.0
+  heterogeneity: 0.1
+  grn_regularization: 0.01
+
+# Data
+data:
+  min_genes_per_cell: 200
+  max_genes_per_cell: 8000
+  min_cells_per_gene: 10
+  max_mito_pct: 25.0
+  n_hvg: 3000
+  val_split: 0.1
+  test_split: 0.1
+
+# Single-Cell Preprocessing
+preprocessing:
+  normalize_target: 10000
+  n_pcs: 50
+  n_neighbors: 15
+  resolution: 1.0
+
+# GRN Inference
+grn:
+  n_propagation_steps: 3
+  min_edge_score: 0.1
+  top_k_edges: 100000
+
+# Perturbation Analysis
+perturbation:
+  simulate_ko: true
+  simulate_oe: true
+  n_genes_to_test: 5000  # Test top N most variable genes
+  effect_threshold: 0.1
+
+# Output
+output:
+  save_grn_edges: true
+  save_embeddings: true
+  generate_report: true
+  report_format: "html"  # html, json, both
+

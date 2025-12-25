@@ -1,0 +1,12 @@
+PPI COFACTOR-TF ANALYSIS
+========================
+
+DNA-binding TFs (JASPAR): 535
+Cofactors (no JASPAR): 945
+High-confidence PPIs: 20,552
+
+Cofactors with DNA-binding partners: 151
+Average partners per cofactor: 2.5
+
+Combined weight range: [0.722, 1.203]
+Combined weight mean: 1.000
