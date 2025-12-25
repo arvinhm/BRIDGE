@@ -342,12 +342,19 @@ class IntegratedGRNModelV7(IntegratedGRNModel):
         # - Same GRN computation
         # - Same context gating (FiLM)
         # - Same delta_basic + delta_neural blending
-        # NOTE: Parent also has cofactor gate, but we apply it here FIRST
-        # for exact per-TF modulation before GRN multiplication
+        #
+        # IMPORTANT: Temporarily disable parent's cofactor gate to prevent
+        # double-gating (we already applied it in Step 1b above)
+        saved_cof_to_tf = getattr(self, 'cof_to_tf_adj', None)
+        self.cof_to_tf_adj = None  # Disable for parent call
+        
         delta, grn_matrix = super().predict_delta_multi_tf(
             tf_activity_modulated, 
             source_expression
         )
+        
+        # Restore cofactor buffer
+        self.cof_to_tf_adj = saved_cof_to_tf
         
         # ============================================================
         # Step 3: Gene→Gene Propagation (NEW in v7 - AFTER parent call)

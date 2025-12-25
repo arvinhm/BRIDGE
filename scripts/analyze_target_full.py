@@ -125,12 +125,14 @@ class GRNAnalyzer:
     """Load and analyze trained GRN model for a target gene."""
     
     def __init__(self, model_dir: str, gene: str, singlecell_path: Optional[str] = None,
-                 ppi_dir: Optional[str] = None, jaspar_dir: Optional[str] = None):
+                 ppi_dir: Optional[str] = None, jaspar_dir: Optional[str] = None,
+                 celltype_key: Optional[str] = None):
         self.model_dir = Path(model_dir)
         self.gene = gene.upper()
         self.singlecell_path = singlecell_path
         self.ppi_dir = Path(ppi_dir) if ppi_dir else None
         self.jaspar_dir = Path(jaspar_dir) if jaspar_dir else None
+        self.celltype_key = celltype_key
         
         self._load_model()
         self._load_singlecell()  # Load h5ad for real validation
@@ -504,9 +506,14 @@ class GRNAnalyzer:
         print(f"  Top repressor: {self.repressors.iloc[0]['tf'] if len(self.repressors) > 0 else 'None'}")
     
     def _load_singlecell(self):
-        """Load single-cell/pseudo-bulk h5ad data for real validation."""
+        """Load single-cell/pseudo-bulk h5ad data for real validation.
+        
+        CRITICAL: For real model inference, we need pseudo-bulk means per celltype,
+        aligned to the same celltypes as tf_activity.npy (from training).
+        """
         self.adata = None
         self.expression_matrix = None
+        self.expression_means = None  # NEW: per-celltype pseudo-bulk means
         self.target_expression = None
         self.cell_type_to_idx = {}
         
@@ -535,11 +542,60 @@ class GRNAnalyzer:
             for i, ct in enumerate(self.celltype_names):
                 self.cell_type_to_idx[ct] = i
         
-        # Find target gene in adata
+        # Gene name mapping
         adata_genes = [g.upper() for g in self.adata.var_names]
+        adata_genes_original = list(self.adata.var_names)
+        
+        # Compute pseudo-bulk means per celltype (CRITICAL for real inference!)
+        if self.celltype_key and self.celltype_key in self.adata.obs.columns:
+            print(f"  Computing pseudo-bulk means using key: '{self.celltype_key}'")
+            
+            # Get expression as DataFrame
+            expr_df = pd.DataFrame(
+                self.expression_matrix,
+                index=self.adata.obs_names,
+                columns=adata_genes_original
+            )
+            expr_df['celltype'] = self.adata.obs[self.celltype_key].values
+            
+            # Compute means per celltype
+            celltype_means = expr_df.groupby('celltype').mean()
+            
+            # Align to our celltype_names order
+            if self.celltype_names is not None:
+                aligned_means = []
+                for ct in self.celltype_names:
+                    if ct in celltype_means.index:
+                        aligned_means.append(celltype_means.loc[ct].values)
+                    else:
+                        # Try case-insensitive match
+                        ct_lower = ct.lower()
+                        match = [c for c in celltype_means.index if c.lower() == ct_lower]
+                        if match:
+                            aligned_means.append(celltype_means.loc[match[0]].values)
+                        else:
+                            aligned_means.append(np.zeros(len(adata_genes)))
+                
+                self.expression_means = np.array(aligned_means)  # (n_celltypes, n_genes)
+                print(f"  Pseudo-bulk means: {self.expression_means.shape}")
+            else:
+                self.expression_means = celltype_means.values
+        else:
+            # Assume already pseudo-bulk (one row per celltype)
+            if self.expression_matrix.shape[0] == len(self.celltype_names) if self.celltype_names else True:
+                print("  Data appears to be pre-aggregated pseudo-bulk")
+                self.expression_means = self.expression_matrix
+            else:
+                print(f"  Warning: Cannot compute pseudo-bulk means without --celltype-key")
+                self.expression_means = None
+        
+        # Find target gene in adata
         if self.gene in adata_genes:
             adata_gene_idx = adata_genes.index(self.gene)
-            self.target_expression = self.expression_matrix[:, adata_gene_idx]
+            if self.expression_means is not None:
+                self.target_expression = self.expression_means[:, adata_gene_idx]
+            else:
+                self.target_expression = self.expression_matrix[:, adata_gene_idx]
             print(f"  Found {self.gene} in h5ad (index {adata_gene_idx})")
             print(f"  Expression range: [{self.target_expression.min():.3f}, {self.target_expression.max():.3f}]")
             print(f"  Mean expression: {self.target_expression.mean():.3f}")
@@ -547,7 +603,7 @@ class GRNAnalyzer:
             print(f"  Warning: {self.gene} not found in h5ad")
             self.target_expression = None
         
-        # Align gene indices between model and adata
+        # Align gene indices between model and adata (for full vector inference)
         self.model_to_adata_genes = {}
         for i, gene in enumerate(self.gene_names):
             gene_upper = gene.upper()
@@ -610,6 +666,9 @@ class GRNAnalyzer:
     def _compute_real_validation(self):
         """Compute real predicted vs observed deltas using h5ad data.
         
+        CRITICAL: Uses pseudo-bulk means per celltype (not per-cell expression!)
+        This ensures tf_activity and expression are aligned by celltype.
+        
         Uses actual model inference if available (with context gating, etc.)
         Falls back to linear approximation if model can't be loaded.
         """
@@ -625,21 +684,45 @@ class GRNAnalyzer:
         
         print("\nComputing real validation metrics...")
         
+        # Check if we have pseudo-bulk means (required for real model inference)
+        has_expression_means = self.expression_means is not None
+        if has_expression_means:
+            print(f"  Using pseudo-bulk means: {self.expression_means.shape}")
+        else:
+            print("  Warning: No pseudo-bulk means, using linear approximation only")
+        
         # Try to load the actual model for real inference
         self._load_torch_model()
-        use_model = self.torch_model is not None
+        use_model = self.torch_model is not None and has_expression_means
         
         # Use the minimum of celltype_names and expression shape
         n_celltypes = min(len(self.celltype_names), len(self.target_expression))
         if self.tf_activity is not None:
             n_celltypes = min(n_celltypes, self.tf_activity.shape[0])
+        if has_expression_means:
+            n_celltypes = min(n_celltypes, self.expression_means.shape[0])
         
         print(f"  Using {n_celltypes} cell types for validation")
-        print(f"  Inference mode: {'Full model' if use_model else 'Linear approximation'}")
+        print(f"  Inference mode: {'Full model (v6/v7)' if use_model else 'Linear approximation'}")
         
         pred_deltas = []
         actual_deltas = []
         celltype_pairs = []
+        
+        # Build source expression vector for model (aligned to model's gene order)
+        def get_source_expression_vector(celltype_idx):
+            """Get full gene expression vector for a celltype, aligned to model's gene order."""
+            if not has_expression_means:
+                return None
+            
+            n_genes = len(self.gene_names)
+            source_vec = np.zeros(n_genes)
+            
+            for model_idx, adata_idx in self.model_to_adata_genes.items():
+                if model_idx < n_genes and adata_idx < self.expression_means.shape[1]:
+                    source_vec[model_idx] = self.expression_means[celltype_idx, adata_idx]
+            
+            return source_vec
         
         # For each cell-type pair, compute predicted and actual delta
         for i in range(n_celltypes):
@@ -650,7 +733,7 @@ class GRNAnalyzer:
                 source_ct = self.celltype_names[i] if i < len(self.celltype_names) else f"CT_{i}"
                 target_ct = self.celltype_names[j] if j < len(self.celltype_names) else f"CT_{j}"
                 
-                # Actual delta (from h5ad)
+                # Actual delta for target gene (from pseudo-bulk means)
                 actual_delta = self.target_expression[j] - self.target_expression[i]
                 
                 # Predicted delta
@@ -661,9 +744,12 @@ class GRNAnalyzer:
                         # Use actual model with context gating, Gene->TF, Gene->Gene, etc.
                         try:
                             import torch
+                            # Get FULL source expression vector (not just target gene!)
+                            source_expr = get_source_expression_vector(i)
+                            
                             with torch.no_grad():
                                 tf_change_t = torch.FloatTensor(tf_activity_change).unsqueeze(0)
-                                source_expr_t = torch.FloatTensor(self.target_expression[i]).unsqueeze(0)
+                                source_expr_t = torch.FloatTensor(source_expr).unsqueeze(0)
                                 pred_delta_all, _ = self.torch_model.predict_delta_multi_tf(
                                     tf_change_t, source_expr_t
                                 )
@@ -1665,6 +1751,8 @@ def main():
                         help='Path to JASPAR specificity directory (optional)')
     parser.add_argument('--output', type=str, required=True,
                         help='Output directory for figures and CSVs')
+    parser.add_argument('--celltype-key', type=str, default=None,
+                        help='Column name in h5ad obs for cell type grouping (e.g., sclc_subcluster)')
     
     args = parser.parse_args()
     
@@ -1683,7 +1771,8 @@ def main():
         gene=args.gene,
         singlecell_path=args.singlecell,
         ppi_dir=args.ppi,
-        jaspar_dir=args.jaspar if args.jaspar else (Path(args.model).parent.parent / 'data' / 'tf_specificity')
+        jaspar_dir=args.jaspar if args.jaspar else (Path(args.model).parent.parent / 'data' / 'tf_specificity'),
+        celltype_key=args.celltype_key
     )
     
     print("\nGenerating figures...")

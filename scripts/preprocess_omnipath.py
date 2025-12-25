@@ -279,7 +279,7 @@ def build_signaling_matrices(
     base_weight: float = 0.5,
     max_weight: float = 1.0,
     saturation: int = 10
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict]:
     """
     Build signaling adjacency matrices from OmniPath data.
     
@@ -439,6 +439,8 @@ def apply_topk_pruning(adj_matrix: np.ndarray, topk: int) -> np.ndarray:
     This reduces memory usage and improves training stability by focusing
     on the most important connections.
     
+    Uses argpartition for O(n) complexity instead of argsort O(n log n).
+    
     Args:
         adj_matrix: (n_source, n_target) adjacency matrix
         topk: Number of edges to keep per source node
@@ -459,15 +461,16 @@ def apply_topk_pruning(adj_matrix: np.ndarray, topk: int) -> np.ndarray:
     
     for i in range(n_source):
         row = adj_matrix[i]
-        if np.count_nonzero(row) == 0:
+        n_nonzero = np.count_nonzero(row)
+        if n_nonzero == 0:
             continue
         
-        # Get indices of top-k by absolute value
-        abs_row = np.abs(row)
-        if np.count_nonzero(abs_row) <= topk:
+        if n_nonzero <= topk:
             pruned[i] = row
         else:
-            topk_indices = np.argsort(abs_row)[-topk:]
+            # Use argpartition for O(n) complexity
+            abs_row = np.abs(row)
+            topk_indices = np.argpartition(abs_row, -topk)[-topk:]
             pruned[i, topk_indices] = row[topk_indices]
     
     return pruned
