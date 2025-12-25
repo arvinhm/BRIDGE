@@ -532,24 +532,22 @@ def main():
         use_gene_tf_modulation=has_omnipath and not args.no_gene_tf_modulation
     )
     
-    # Set priors (from train_v6)
-    model.set_priors(
-        chip_binding=torch.from_numpy(binding_matrix),
-        tf_tf_adjacency=torch.from_numpy(tf_tf_combined),
-    )
-    
-    # Load PPI (from train_v6)
+    # Load PPI cofactor data if available
+    cof_to_tf = None
+    cof_indices = None
     if args.ppi:
         ppi_dir = Path(args.ppi)
         if (ppi_dir / 'cof_to_tf_adj.npy').exists():
             cof_to_tf = np.load(ppi_dir / 'cof_to_tf_adj.npy')
             cof_indices = np.load(ppi_dir / 'cofactor_gene_indices.npy')
-            model.set_priors(
-                chip_binding=torch.from_numpy(binding_matrix),
-                tf_tf_adjacency=torch.from_numpy(tf_tf_combined),
-                cofactor_tf_adjacency=torch.from_numpy(cof_to_tf),
-                cofactor_gene_indices=torch.from_numpy(cof_indices)
-            )
+    
+    # Set all priors in ONE call (from train_v6)
+    model.set_priors(
+        chip_binding=torch.from_numpy(binding_matrix),
+        tf_tf_adjacency=torch.from_numpy(tf_tf_combined),
+        cofactor_tf_adjacency=torch.from_numpy(cof_to_tf) if cof_to_tf is not None else None,
+        cofactor_gene_indices=torch.from_numpy(cof_indices) if cof_indices is not None else None
+    )
     
     # Set OmniPath priors (NEW in v7)
     if has_omnipath:

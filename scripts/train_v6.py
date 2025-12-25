@@ -465,13 +465,24 @@ class IntegratedGRNModel(nn.Module):
             self.config['uses_tf_specificity'] = True
             
         if cofactor_tf_adjacency is not None and cofactor_gene_indices is not None:
-            self.register_buffer('cof_to_tf_adj', cofactor_tf_adjacency.to(device))
-            self.register_buffer('cofactor_gene_indices', cofactor_gene_indices.to(device))
+            # Check if buffers already exist (may be pre-registered in subclass)
+            if hasattr(self, 'cof_to_tf_adj') and self.cof_to_tf_adj is not None:
+                self.cof_to_tf_adj.copy_(cofactor_tf_adjacency.to(device))
+            else:
+                self.register_buffer('cof_to_tf_adj', cofactor_tf_adjacency.to(device))
+            
+            if hasattr(self, 'cofactor_gene_indices') and self.cofactor_gene_indices is not None:
+                self.cofactor_gene_indices.copy_(cofactor_gene_indices.to(device))
+            else:
+                self.register_buffer('cofactor_gene_indices', cofactor_gene_indices.to(device))
+            
             self.config['uses_cofactor_gate'] = True
             print(f"  [Cofactor Gate] {len(cofactor_gene_indices)} cofactors -> {self.n_tfs} TFs")
         else:
-            self.cof_to_tf_adj = None
-            self.cofactor_gene_indices = None
+            if not hasattr(self, 'cof_to_tf_adj'):
+                self.cof_to_tf_adj = None
+            if not hasattr(self, 'cofactor_gene_indices'):
+                self.cofactor_gene_indices = None
     
     @property
     def chip_leakage(self) -> torch.Tensor:
