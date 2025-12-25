@@ -4,28 +4,14 @@ Full Gene Regulatory Network Analysis for Target Gene
 ======================================================
 Nature-quality multi-panel figures analyzing TF regulation of a target gene.
 
-Compatible with both train_v5.py (DeltaGRNModel) and train_v6.py (MonsterGRNModel).
-
 Produces:
 - Figure 1: "What regulates the target?" (10 panels)
 - Figure 2: "Why these regulators?" (10 panels)  
 - Figure 3: "Calibration & controllability" (10 panels)
-- Figure 4: "TF Generalizability Analysis" (10 panels) - NEW!
-  * UMAP/PCA embeddings colored by TF effects
-  * Generalizability scores (which TFs work across all cell types?)
-  * Heatmap of TF effects across cell types
-  * Therapeutic target recommendations (effect × generalizability)
-- CSVs with all underlying data including tf_generalizability_<gene>.csv
+- CSVs with all underlying data
 
 Inspired by Nature-style figures with density contours, clean aesthetics,
 and actionable intervention recommendations.
-
-Usage:
-    python scripts/analyze_target_full.py \\
-        --gene SSTR2 \\
-        --model results/sclc_grn_v6/ \\
-        --ppi data/ppi/ \\
-        --output analysis/SSTR2_full/
 """
 
 import argparse
@@ -139,17 +125,14 @@ class GRNAnalyzer:
     """Load and analyze trained GRN model for a target gene."""
     
     def __init__(self, model_dir: str, gene: str, singlecell_path: Optional[str] = None,
-                 ppi_dir: Optional[str] = None, jaspar_dir: Optional[str] = None,
-                 finetune_dir: Optional[str] = None):
+                 ppi_dir: Optional[str] = None, jaspar_dir: Optional[str] = None):
         self.model_dir = Path(model_dir)
         self.gene = gene.upper()
         self.singlecell_path = singlecell_path
         self.ppi_dir = Path(ppi_dir) if ppi_dir else None
         self.jaspar_dir = Path(jaspar_dir) if jaspar_dir else None
-        self.finetune_dir = Path(finetune_dir) if finetune_dir else None
         
         self._load_model()
-        self._load_finetune()  # Load fine-tuned model if available
         self._load_singlecell()  # Load h5ad for real validation
         self._find_gene_index()
         self._compute_regulators()
@@ -174,34 +157,23 @@ class GRNAnalyzer:
         else:
             self.tf_names = None
         
-        # ALWAYS compute GRN from checkpoint to avoid the tf_importance bug
-        # (Pre-saved grn_matrix.npy may have been scaled by softmaxed tf_importance,
-        # which reduces all values by ~1000x!)
-        model_path = self.model_dir / 'best_model.pt'
-        grn_correct_path = self.model_dir / 'grn_matrix_CORRECT.npy'
-        
-        if grn_correct_path.exists():
-            # Use verified correct GRN
-            self.grn_matrix = np.load(grn_correct_path)
-            print(f"  GRN matrix (verified correct): {self.grn_matrix.shape}")
-        elif model_path.exists():
-            # Compute from checkpoint with correct formula
-            print("  Computing GRN matrix from model checkpoint (correct formula)...")
-            self.grn_matrix = self._compute_grn_from_checkpoint(model_path)
-            print(f"  GRN matrix (computed): {self.grn_matrix.shape}")
-            print(f"  GRN range: [{self.grn_matrix.min():.4f}, {self.grn_matrix.max():.4f}]")
-            # Save correct version
-            np.save(grn_correct_path, self.grn_matrix)
-            print(f"  Saved CORRECT GRN matrix to {grn_correct_path}")
+        # Try to load pre-computed GRN matrix first
+        grn_path = self.model_dir / 'grn_matrix.npy'
+        if grn_path.exists():
+            self.grn_matrix = np.load(grn_path)
+            print(f"  GRN matrix (pre-computed): {self.grn_matrix.shape}")
         else:
-            # Fallback to pre-computed (may be wrong!)
-            grn_path = self.model_dir / 'grn_matrix.npy'
-            if grn_path.exists():
-                self.grn_matrix = np.load(grn_path)
-                print(f"  WARNING: Using pre-computed GRN (may have tf_importance bug!)")
-                print(f"  GRN matrix: {self.grn_matrix.shape}")
+            # Compute from model checkpoint
+            model_path = self.model_dir / 'best_model.pt'
+            if model_path.exists():
+                print("  Computing GRN matrix from model checkpoint...")
+                self.grn_matrix = self._compute_grn_from_checkpoint(model_path)
+                print(f"  GRN matrix (computed): {self.grn_matrix.shape}")
+                # Save for future use
+                np.save(grn_path, self.grn_matrix)
+                print(f"  Saved GRN matrix to {grn_path}")
             else:
-                raise FileNotFoundError(f"Neither best_model.pt nor grn_matrix.npy found in {self.model_dir}")
+                raise FileNotFoundError(f"Neither grn_matrix.npy nor best_model.pt found in {self.model_dir}")
         
         # ALWAYS align names to GRN matrix dimensions
         n_genes_grn = self.grn_matrix.shape[0]
@@ -278,7 +250,6 @@ class GRNAnalyzer:
             self.cof_to_tf = None
             self.cofactor_indices = None
             self.tf_tf_ppi = None
-            self.cofactor_info = None  # Initialize to None when PPI not available
             
         # Load optional JASPAR specificity
         if self.jaspar_dir and self.jaspar_dir.exists():
@@ -295,70 +266,13 @@ class GRNAnalyzer:
             self.baselines = {}
             
     def _compute_grn_from_checkpoint(self, model_path: Path) -> np.ndarray:
-        """Compute FULL GRN matrix from saved model checkpoint.
-        
-        Supports both train_v5 (DeltaGRNModel) and train_v6 (MonsterGRNModel) formats.
-        """
+        """Compute FULL GRN matrix from saved model checkpoint."""
         import torch
         import torch.nn as nn
         
         # Load checkpoint
         checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
         state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
-        
-        # Detect model format
-        is_v6 = 'grn_head.tf_to_gene.weight' in state_dict
-        is_v5 = 'direct_effects' in state_dict
-        
-        if is_v6:
-            return self._compute_grn_v6(state_dict)
-        elif is_v5:
-            return self._compute_grn_v5(state_dict)
-        else:
-            raise ValueError("Unknown model format - no direct_effects or grn_head found")
-    
-    def _compute_grn_v6(self, state_dict: dict) -> np.ndarray:
-        """Compute GRN matrix from train_v6 MonsterGRNModel checkpoint."""
-        import torch
-        
-        print("    Detected train_v6 (MonsterGRNModel) format")
-        
-        # Get the TF→Gene weights from the GRN head
-        tf_to_gene = state_dict['grn_head.tf_to_gene.weight']  # (n_genes, tf_dim)
-        n_genes = tf_to_gene.shape[0]
-        tf_dim = tf_to_gene.shape[1]
-        
-        print(f"    GRN head: {n_genes} genes x {tf_dim} TF dims")
-        
-        # The grn_head.tf_to_gene maps from TF representation to gene effects
-        # We need to extract the effective TF→Gene weights
-        grn_matrix = tf_to_gene.numpy()  # (n_genes, n_tfs)
-        
-        print(f"    GRN matrix range: [{grn_matrix.min():.4f}, {grn_matrix.max():.4f}]")
-        
-        # Apply ChIP mask if available
-        if 'chip_mask' in state_dict:
-            chip_mask = state_dict['chip_mask'].numpy()
-            if chip_mask.shape == grn_matrix.shape:
-                # Use learned leakage
-                if '_leakage_raw' in state_dict:
-                    leakage_raw = state_dict['_leakage_raw'].item()
-                    leakage = 0.005 + 0.195 * (1 / (1 + np.exp(-leakage_raw)))
-                else:
-                    leakage = 0.1
-                print(f"    Applying ChIP mask with leakage={leakage:.4f}")
-                grn_matrix = grn_matrix * (chip_mask + leakage)
-        
-        print(f"    Final GRN range: [{grn_matrix.min():.4f}, {grn_matrix.max():.4f}]")
-        
-        return grn_matrix
-    
-    def _compute_grn_v5(self, state_dict: dict) -> np.ndarray:
-        """Compute GRN matrix from train_v5 DeltaGRNModel checkpoint."""
-        import torch
-        import torch.nn as nn
-        
-        print("    Detected train_v5 (DeltaGRNModel) format")
         
         # Get dimensions
         n_genes = state_dict['direct_effects'].shape[0]
@@ -457,56 +371,6 @@ class GRNAnalyzer:
         
         return grn_matrix.numpy()
     
-    def _load_finetune(self):
-        """Load fine-tuned gene-specific model if available."""
-        self.finetune_importance = None
-        self.finetune_val_r = None
-        self.has_finetune = False
-        
-        if self.finetune_dir is None:
-            return
-        
-        finetune_path = self.finetune_dir / 'best_head.pt'
-        if not finetune_path.exists():
-            print(f"  Fine-tuned model not found at {finetune_path}")
-            return
-        
-        print(f"\nLoading fine-tuned model from {self.finetune_dir}...")
-        
-        try:
-            import torch
-            checkpoint = torch.load(finetune_path, map_location='cpu', weights_only=False)
-            
-            # Check if it's for the right gene
-            if 'target_gene' in checkpoint:
-                if checkpoint['target_gene'].upper() != self.gene:
-                    print(f"  Warning: Fine-tuned for {checkpoint['target_gene']}, not {self.gene}")
-                    return
-            
-            # Load TF importance weights
-            if 'tf_importance' in checkpoint:
-                self.finetune_importance = checkpoint['tf_importance']
-                print(f"  Loaded TF importance: shape={self.finetune_importance.shape}")
-            
-            # Load validation metrics
-            if 'best_val_r' in checkpoint:
-                self.finetune_val_r = checkpoint['best_val_r']
-                print(f"  Fine-tune validation r: {self.finetune_val_r:.4f}")
-            
-            self.has_finetune = True
-            print(f"  ✓ Fine-tuned model loaded successfully!")
-            
-        except Exception as e:
-            print(f"  Error loading fine-tuned model: {e}")
-        
-        # Also try to load config for more info
-        config_path = self.finetune_dir / 'config.json'
-        if config_path.exists():
-            with open(config_path) as f:
-                self.finetune_config = json.load(f)
-        else:
-            self.finetune_config = {}
-    
     def _load_ppi(self):
         """Load PPI matrices."""
         print(f"Loading PPI from {self.ppi_dir}...")
@@ -586,28 +450,6 @@ class GRNAnalyzer:
         # Extract effects for target gene
         self.effects = self.grn_matrix[self.gene_idx, :]
         
-        # If fine-tuned model available, use its learned importance to weight effects
-        if self.has_finetune and self.finetune_importance is not None:
-            print(f"\n  Using fine-tuned TF importance weights!")
-            # Align lengths
-            n_tfs = min(len(self.effects), len(self.finetune_importance))
-            
-            # Combine: effect magnitude × learned importance
-            # This gives importance-weighted effects
-            importance = self.finetune_importance[:n_tfs]
-            
-            # Normalize importance to have mean=1 (so it scales, not replaces)
-            importance_normalized = importance / (importance.mean() + 1e-8)
-            
-            # Create combined score: effect direction × importance magnitude
-            self.effects_finetune = self.effects[:n_tfs] * importance_normalized
-            
-            # Also store raw importance for display
-            self.tf_importance = importance
-        else:
-            self.effects_finetune = self.effects
-            self.tf_importance = None
-        
         # Compute z-score normalized effects
         effect_mean = np.mean(self.effects)
         effect_std = np.std(self.effects)
@@ -628,17 +470,6 @@ class GRNAnalyzer:
             'sign': np.sign(self.effects),
             'type': ['activator' if e > 0 else 'repressor' for e in self.effects]
         })
-        
-        # Add fine-tuned importance if available
-        if self.tf_importance is not None:
-            self.regulators['finetune_importance'] = self.tf_importance
-            self.regulators['combined_score'] = np.abs(self.effects_finetune)
-            # Re-rank by combined score
-            self.regulators = self.regulators.sort_values('combined_score', ascending=False)
-            print(f"  Regulators ranked by combined (effect × importance) score")
-        else:
-            self.regulators['finetune_importance'] = np.nan
-            self.regulators['combined_score'] = self.regulators['abs_effect']
         
         print(f"  Effect range: [{self.effects.min():.2f}, {self.effects.max():.2f}]")
         print(f"  Z-score range: [{self.effects_zscore.min():.2f}, {self.effects_zscore.max():.2f}]")
@@ -725,8 +556,63 @@ class GRNAnalyzer:
         
         print(f"  Aligned {len(self.model_to_adata_genes)}/{len(self.gene_names)} genes")
     
+    def _load_torch_model(self):
+        """Load the actual PyTorch model for real inference."""
+        self.torch_model = None
+        
+        model_path = self.model_dir / 'best_model.pt'
+        if not model_path.exists():
+            return None
+        
+        try:
+            import torch
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            
+            # Try v7 first, then v6
+            try:
+                from scripts.train_v7 import IntegratedGRNModelV7
+                model_class = IntegratedGRNModelV7
+                print("  Using IntegratedGRNModelV7")
+            except ImportError:
+                try:
+                    from scripts.train_v6 import IntegratedGRNModel
+                    model_class = IntegratedGRNModel
+                    print("  Using IntegratedGRNModel (v6)")
+                except ImportError:
+                    print("  Could not import model class, using linear approximation")
+                    return None
+            
+            # Load checkpoint
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+            config = checkpoint.get('config', {})
+            
+            # Initialize model
+            n_genes = config.get('n_genes', len(self.gene_names) if self.gene_names else 26660)
+            n_tfs = config.get('n_tfs', len(self.tf_names) if self.tf_names else 1480)
+            
+            model = model_class(n_genes=n_genes, n_tfs=n_tfs, **{k: v for k, v in config.items() 
+                                                                   if k not in ['n_genes', 'n_tfs', 'model_version']})
+            
+            # Load state dict
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            model.load_state_dict(state_dict, strict=False)
+            model.eval()
+            
+            self.torch_model = model
+            print(f"  Loaded PyTorch model for real inference")
+            return model
+            
+        except Exception as e:
+            print(f"  Could not load PyTorch model: {e}")
+            return None
+    
     def _compute_real_validation(self):
-        """Compute real predicted vs observed deltas using h5ad data."""
+        """Compute real predicted vs observed deltas using h5ad data.
+        
+        Uses actual model inference if available (with context gating, etc.)
+        Falls back to linear approximation if model can't be loaded.
+        """
         self.real_pred_deltas = None
         self.real_actual_deltas = None
         self.celltype_performance = None
@@ -739,12 +625,17 @@ class GRNAnalyzer:
         
         print("\nComputing real validation metrics...")
         
+        # Try to load the actual model for real inference
+        self._load_torch_model()
+        use_model = self.torch_model is not None
+        
         # Use the minimum of celltype_names and expression shape
         n_celltypes = min(len(self.celltype_names), len(self.target_expression))
         if self.tf_activity is not None:
             n_celltypes = min(n_celltypes, self.tf_activity.shape[0])
         
         print(f"  Using {n_celltypes} cell types for validation")
+        print(f"  Inference mode: {'Full model' if use_model else 'Linear approximation'}")
         
         pred_deltas = []
         actual_deltas = []
@@ -762,11 +653,28 @@ class GRNAnalyzer:
                 # Actual delta (from h5ad)
                 actual_delta = self.target_expression[j] - self.target_expression[i]
                 
-                # Predicted delta: sum of TF effects weighted by TF activity changes
+                # Predicted delta
                 if self.tf_activity is not None and i < self.tf_activity.shape[0] and j < self.tf_activity.shape[0]:
                     tf_activity_change = self.tf_activity[j, :] - self.tf_activity[i, :]
-                    # Predicted delta = sum(effect * tf_activity_change)
-                    pred_delta = np.sum(self.effects * tf_activity_change)
+                    
+                    if use_model:
+                        # Use actual model with context gating, Gene->TF, Gene->Gene, etc.
+                        try:
+                            import torch
+                            with torch.no_grad():
+                                tf_change_t = torch.FloatTensor(tf_activity_change).unsqueeze(0)
+                                source_expr_t = torch.FloatTensor(self.target_expression[i]).unsqueeze(0)
+                                pred_delta_all, _ = self.torch_model.predict_delta_multi_tf(
+                                    tf_change_t, source_expr_t
+                                )
+                                # Get prediction for target gene
+                                pred_delta = pred_delta_all[0, self.gene_idx].item()
+                        except Exception as e:
+                            # Fallback to linear
+                            pred_delta = np.sum(self.effects * tf_activity_change)
+                    else:
+                        # Linear approximation: delta = sum(effect * tf_activity_change)
+                        pred_delta = np.sum(self.effects * tf_activity_change)
                 else:
                     pred_delta = 0.0
                 
@@ -806,428 +714,6 @@ class GRNAnalyzer:
             'celltype': self.celltype_names[:n_expr],
             'expression': self.target_expression[:n_expr] if self.target_expression is not None else [np.nan] * n_expr
         }).sort_values('expression', ascending=False)
-
-
-# ============================================================================
-# TF GENERALIZABILITY ANALYSIS
-# ============================================================================
-
-def compute_tf_generalizability(analyzer: GRNAnalyzer) -> pd.DataFrame:
-    """
-    Compute TF generalizability across cell types.
-    
-    A TF is "generalizable" if its effect on the target gene is consistent
-    across different cell types (same direction, similar magnitude).
-    
-    Returns DataFrame with columns:
-    - tf: TF name
-    - effect: Average effect on target gene
-    - consistency: Fraction of cell-type pairs with same direction effect
-    - effect_std: Standard deviation of effect across pairs
-    - generalizability_score: Combined metric (high = generalizable)
-    - n_positive: Number of cell types where TF increases target
-    - n_negative: Number of cell types where TF decreases target
-    """
-    if analyzer.tf_activity is None or analyzer.grn_matrix is None:
-        print("  Warning: Cannot compute generalizability without TF activity data")
-        return None
-    
-    n_celltypes = analyzer.tf_activity.shape[0]
-    n_tfs = analyzer.tf_activity.shape[1]
-    target_idx = analyzer.gene_idx
-    
-    # Get target gene row from GRN
-    target_grn = analyzer.grn_matrix[target_idx, :]  # (n_tfs,)
-    
-    # Compute per-cell-type TF effect on target gene
-    # For each cell type, the predicted effect is: TF_activity × GRN_weight
-    # This shows how each TF contributes to target expression in each cell type
-    tf_effects_per_celltype = analyzer.tf_activity * target_grn[np.newaxis, :]  # (n_ct, n_tfs)
-    
-    generalizability_data = []
-    
-    for tf_idx in range(n_tfs):
-        tf_name = analyzer.tf_names[tf_idx] if tf_idx < len(analyzer.tf_names) else f"TF_{tf_idx}"
-        
-        effects = tf_effects_per_celltype[:, tf_idx]  # Effect in each cell type
-        
-        # Skip TFs with no effect
-        if np.abs(effects).max() < 1e-6:
-            continue
-        
-        # Consistency: fraction of non-zero effects with same sign
-        nonzero_mask = np.abs(effects) > 1e-6
-        if nonzero_mask.sum() > 1:
-            signs = np.sign(effects[nonzero_mask])
-            n_positive = (signs > 0).sum()
-            n_negative = (signs < 0).sum()
-            consistency = max(n_positive, n_negative) / len(signs)
-        else:
-            consistency = 1.0
-            n_positive = int(effects.sum() > 0)
-            n_negative = int(effects.sum() < 0)
-        
-        # Effect statistics
-        mean_effect = effects.mean()
-        effect_std = effects.std()
-        abs_mean_effect = np.abs(effects).mean()
-        
-        # Coefficient of variation (lower = more consistent)
-        cv = effect_std / (abs_mean_effect + 1e-8)
-        
-        # Generalizability score: high effect + high consistency + low variance
-        # Scale 0-1 where 1 = perfectly generalizable
-        generalizability_score = consistency * (1 - min(cv, 1)) * min(abs_mean_effect * 10, 1)
-        
-        generalizability_data.append({
-            'tf': tf_name,
-            'tf_idx': tf_idx,
-            'effect': mean_effect,
-            'abs_effect': abs_mean_effect,
-            'effect_std': effect_std,
-            'consistency': consistency,
-            'cv': cv,
-            'generalizability_score': generalizability_score,
-            'n_positive': n_positive,
-            'n_negative': n_negative,
-            'grn_weight': target_grn[tf_idx],
-            'is_activator': target_grn[tf_idx] > 0
-        })
-    
-    df = pd.DataFrame(generalizability_data)
-    
-    if len(df) > 0:
-        df = df.sort_values('generalizability_score', ascending=False)
-    
-    return df
-
-
-def create_figure4(analyzer: GRNAnalyzer, output_dir: Path):
-    """
-    Create Figure 4: TF Generalizability Analysis (8 panels)
-    
-    Shows which TFs have consistent effects across cell types.
-    """
-    from sklearn.decomposition import PCA
-    from sklearn.preprocessing import StandardScaler
-    
-    # Check if we can create UMAP
-    try:
-        from umap import UMAP
-        HAS_UMAP = True
-    except ImportError:
-        HAS_UMAP = False
-        print("  Note: UMAP not installed, using PCA instead")
-    
-    fig = plt.figure(figsize=(18, 14))
-    gs = GridSpec(3, 4, figure=fig, hspace=0.35, wspace=0.3)
-    
-    gene = analyzer.gene_name
-    
-    # Compute generalizability
-    gen_df = compute_tf_generalizability(analyzer)
-    if gen_df is None or len(gen_df) == 0:
-        print("  Cannot create Figure 4: No generalizability data")
-        plt.close()
-        return
-    
-    # Store for later use
-    analyzer.generalizability_df = gen_df
-    
-    # Get TF effects per cell type for embedding
-    target_grn = analyzer.grn_matrix[analyzer.gene_idx, :]
-    tf_effects_per_celltype = analyzer.tf_activity * target_grn[np.newaxis, :]
-    
-    # =========================================================================
-    # Panel A: Cell-type embedding colored by top activator effect
-    # =========================================================================
-    ax_a = fig.add_subplot(gs[0, 0])
-    add_panel_label(ax_a, 'A')
-    
-    # Get embedding of cell types based on all TF activities
-    scaler = StandardScaler()
-    tf_scaled = scaler.fit_transform(analyzer.tf_activity)
-    
-    if HAS_UMAP and analyzer.tf_activity.shape[0] > 15:
-        embedding = UMAP(n_neighbors=min(15, analyzer.tf_activity.shape[0]-1), 
-                        min_dist=0.1, random_state=42).fit_transform(tf_scaled)
-        embed_label = "UMAP"
-    else:
-        pca = PCA(n_components=2, random_state=42)
-        embedding = pca.fit_transform(tf_scaled)
-        embed_label = "PCA"
-    
-    # Color by top activator's effect
-    top_activator = gen_df[gen_df['is_activator']].iloc[0] if len(gen_df[gen_df['is_activator']]) > 0 else None
-    
-    if top_activator is not None:
-        top_tf_idx = int(top_activator['tf_idx'])
-        top_tf_effects = tf_effects_per_celltype[:, top_tf_idx]
-        
-        scatter = ax_a.scatter(embedding[:, 0], embedding[:, 1], 
-                              c=top_tf_effects, cmap='RdBu_r', 
-                              s=80, edgecolors='black', linewidths=0.5,
-                              vmin=-np.abs(top_tf_effects).max(),
-                              vmax=np.abs(top_tf_effects).max())
-        plt.colorbar(scatter, ax=ax_a, label=f'{top_activator["tf"]} effect')
-        ax_a.set_title(f'Cell Types by Top Activator\n({top_activator["tf"]})', fontsize=10)
-    else:
-        ax_a.text(0.5, 0.5, 'No activators', ha='center', va='center', transform=ax_a.transAxes)
-        ax_a.set_title('Cell Types by Top Activator', fontsize=10)
-    
-    ax_a.set_xlabel(f'{embed_label} 1', fontsize=9)
-    ax_a.set_ylabel(f'{embed_label} 2', fontsize=9)
-    
-    # =========================================================================
-    # Panel B: Cell-type embedding colored by top repressor effect
-    # =========================================================================
-    ax_b = fig.add_subplot(gs[0, 1])
-    add_panel_label(ax_b, 'B')
-    
-    top_repressor = gen_df[~gen_df['is_activator']].iloc[0] if len(gen_df[~gen_df['is_activator']]) > 0 else None
-    
-    if top_repressor is not None:
-        top_tf_idx = int(top_repressor['tf_idx'])
-        top_tf_effects = tf_effects_per_celltype[:, top_tf_idx]
-        
-        scatter = ax_b.scatter(embedding[:, 0], embedding[:, 1], 
-                              c=top_tf_effects, cmap='RdBu_r', 
-                              s=80, edgecolors='black', linewidths=0.5,
-                              vmin=-np.abs(top_tf_effects).max(),
-                              vmax=np.abs(top_tf_effects).max())
-        plt.colorbar(scatter, ax=ax_b, label=f'{top_repressor["tf"]} effect')
-        ax_b.set_title(f'Cell Types by Top Repressor\n({top_repressor["tf"]})', fontsize=10)
-    else:
-        ax_b.text(0.5, 0.5, 'No repressors', ha='center', va='center', transform=ax_b.transAxes)
-        ax_b.set_title('Cell Types by Top Repressor', fontsize=10)
-    
-    ax_b.set_xlabel(f'{embed_label} 1', fontsize=9)
-    ax_b.set_ylabel(f'{embed_label} 2', fontsize=9)
-    
-    # =========================================================================
-    # Panel C: Generalizability scores - top TFs
-    # =========================================================================
-    ax_c = fig.add_subplot(gs[0, 2])
-    add_panel_label(ax_c, 'C')
-    
-    top_n = min(20, len(gen_df))
-    top_gen = gen_df.head(top_n)
-    
-    colors = [COLORS['activator'] if x else COLORS['repressor'] for x in top_gen['is_activator']]
-    bars = ax_c.barh(range(top_n), top_gen['generalizability_score'], color=colors)
-    ax_c.set_yticks(range(top_n))
-    ax_c.set_yticklabels(top_gen['tf'], fontsize=7)
-    ax_c.set_xlabel('Generalizability Score', fontsize=9)
-    ax_c.set_title('Most Generalizable TFs', fontsize=10)
-    ax_c.invert_yaxis()
-    ax_c.axvline(0.5, color='gray', linestyle='--', alpha=0.5)
-    
-    # Legend
-    act_patch = mpatches.Patch(color=COLORS['activator'], label='Activator')
-    rep_patch = mpatches.Patch(color=COLORS['repressor'], label='Repressor')
-    ax_c.legend(handles=[act_patch, rep_patch], loc='lower right', fontsize=7)
-    
-    # =========================================================================
-    # Panel D: Effect magnitude vs Generalizability scatter
-    # =========================================================================
-    ax_d = fig.add_subplot(gs[0, 3])
-    add_panel_label(ax_d, 'D')
-    
-    activators = gen_df[gen_df['is_activator']]
-    repressors = gen_df[~gen_df['is_activator']]
-    
-    ax_d.scatter(activators['abs_effect'], activators['generalizability_score'],
-                c=COLORS['activator'], alpha=0.6, s=30, label='Activators')
-    ax_d.scatter(repressors['abs_effect'], repressors['generalizability_score'],
-                c=COLORS['repressor'], alpha=0.6, s=30, label='Repressors')
-    
-    # Highlight top generalizable TFs
-    for _, row in gen_df.head(5).iterrows():
-        ax_d.annotate(row['tf'], (row['abs_effect'], row['generalizability_score']),
-                     fontsize=6, alpha=0.8)
-    
-    ax_d.set_xlabel('|Effect|', fontsize=9)
-    ax_d.set_ylabel('Generalizability', fontsize=9)
-    ax_d.set_title('Effect Size vs Generalizability', fontsize=10)
-    ax_d.legend(fontsize=7)
-    
-    # =========================================================================
-    # Panel E: Consistency distribution
-    # =========================================================================
-    ax_e = fig.add_subplot(gs[1, 0])
-    add_panel_label(ax_e, 'E')
-    
-    ax_e.hist(gen_df['consistency'], bins=20, color=COLORS['cascade'], edgecolor='white', alpha=0.8)
-    ax_e.axvline(gen_df['consistency'].median(), color='red', linestyle='--', 
-                label=f'Median: {gen_df["consistency"].median():.2f}')
-    ax_e.set_xlabel('Consistency (same direction fraction)', fontsize=9)
-    ax_e.set_ylabel('# TFs', fontsize=9)
-    ax_e.set_title('TF Effect Consistency', fontsize=10)
-    ax_e.legend(fontsize=7)
-    
-    # =========================================================================
-    # Panel F: Heatmap of top generalizable TF effects across cell types
-    # =========================================================================
-    ax_f = fig.add_subplot(gs[1, 1:3])
-    add_panel_label(ax_f, 'F')
-    
-    # Get top 15 most generalizable TFs
-    top_gen_tfs = gen_df.head(15)
-    tf_indices = top_gen_tfs['tf_idx'].astype(int).values
-    tf_labels = top_gen_tfs['tf'].values
-    
-    # Get their effects per cell type
-    effects_matrix = tf_effects_per_celltype[:, tf_indices].T  # (n_tfs, n_ct)
-    
-    # Z-score normalize for visualization
-    effects_z = stats.zscore(effects_matrix, axis=1)
-    effects_z = np.nan_to_num(effects_z, 0)
-    
-    # Limit cell types for readability
-    max_ct = min(30, effects_matrix.shape[1])
-    ct_indices = np.linspace(0, effects_matrix.shape[1]-1, max_ct).astype(int)
-    ct_labels = [analyzer.celltype_names[i][:15] if i < len(analyzer.celltype_names) else f'CT{i}' 
-                 for i in ct_indices]
-    
-    im = ax_f.imshow(effects_z[:, ct_indices], cmap='RdBu_r', aspect='auto',
-                     vmin=-2, vmax=2)
-    ax_f.set_xticks(range(len(ct_labels)))
-    ax_f.set_xticklabels(ct_labels, rotation=45, ha='right', fontsize=6)
-    ax_f.set_yticks(range(len(tf_labels)))
-    ax_f.set_yticklabels(tf_labels, fontsize=7)
-    ax_f.set_xlabel('Cell Type', fontsize=9)
-    ax_f.set_ylabel('TF', fontsize=9)
-    ax_f.set_title(f'Top Generalizable TF Effects on {gene} (Z-scored)', fontsize=10)
-    plt.colorbar(im, ax=ax_f, label='Effect (Z-score)')
-    
-    # =========================================================================
-    # Panel G: Context-specific vs universal TFs
-    # =========================================================================
-    ax_g = fig.add_subplot(gs[1, 3])
-    add_panel_label(ax_g, 'G')
-    
-    # Classify TFs
-    universal = gen_df[gen_df['consistency'] > 0.9]
-    context_specific = gen_df[gen_df['consistency'] < 0.7]
-    intermediate = gen_df[(gen_df['consistency'] >= 0.7) & (gen_df['consistency'] <= 0.9)]
-    
-    counts = [len(universal), len(intermediate), len(context_specific)]
-    labels = [f'Universal\n(>90% consistent)\nn={len(universal)}',
-              f'Mixed\n(70-90%)\nn={len(intermediate)}',
-              f'Context-Specific\n(<70%)\nn={len(context_specific)}']
-    colors = [COLORS['activator'], COLORS['neutral'], COLORS['repressor']]
-    
-    ax_g.pie(counts, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-    ax_g.set_title('TF Classification by Consistency', fontsize=10)
-    
-    # =========================================================================
-    # Panel H: Cell-type embedding colored by target gene expression
-    # =========================================================================
-    ax_h = fig.add_subplot(gs[2, 0])
-    add_panel_label(ax_h, 'H')
-    
-    if analyzer.target_expression is not None:
-        expr = analyzer.target_expression[:len(embedding)]
-        scatter = ax_h.scatter(embedding[:, 0], embedding[:, 1], 
-                              c=expr, cmap='viridis', 
-                              s=80, edgecolors='black', linewidths=0.5)
-        plt.colorbar(scatter, ax=ax_h, label=f'{gene} expression')
-        ax_h.set_title(f'{gene} Expression Landscape', fontsize=10)
-    else:
-        ax_h.text(0.5, 0.5, 'No expression data', ha='center', va='center', transform=ax_h.transAxes)
-        ax_h.set_title(f'{gene} Expression', fontsize=10)
-    
-    ax_h.set_xlabel(f'{embed_label} 1', fontsize=9)
-    ax_h.set_ylabel(f'{embed_label} 2', fontsize=9)
-    
-    # =========================================================================
-    # Panel I: Best therapeutic targets (high effect + high generalizability)
-    # =========================================================================
-    ax_i = fig.add_subplot(gs[2, 1:3])
-    add_panel_label(ax_i, 'I')
-    
-    # Compute therapeutic score: effect × generalizability
-    gen_df['therapeutic_score'] = gen_df['abs_effect'] * gen_df['generalizability_score']
-    top_therapeutic = gen_df.nlargest(15, 'therapeutic_score')
-    
-    x = np.arange(len(top_therapeutic))
-    width = 0.35
-    
-    colors = [COLORS['activator'] if a else COLORS['repressor'] for a in top_therapeutic['is_activator']]
-    
-    bars1 = ax_i.bar(x - width/2, top_therapeutic['abs_effect'], width, 
-                    label='|Effect|', color=colors, alpha=0.7)
-    bars2 = ax_i.bar(x + width/2, top_therapeutic['generalizability_score'], width,
-                    label='Generalizability', color=COLORS['cascade'], alpha=0.7)
-    
-    ax_i.set_xticks(x)
-    ax_i.set_xticklabels(top_therapeutic['tf'], rotation=45, ha='right', fontsize=7)
-    ax_i.set_ylabel('Score', fontsize=9)
-    ax_i.set_title(f'Best Therapeutic Targets for {gene}\n(High Effect × High Generalizability)', fontsize=10)
-    ax_i.legend(fontsize=7)
-    
-    # =========================================================================
-    # Panel J: Summary statistics
-    # =========================================================================
-    ax_j = fig.add_subplot(gs[2, 3])
-    add_panel_label(ax_j, 'J')
-    ax_j.axis('off')
-    
-    # Key stats
-    n_universal = len(gen_df[gen_df['consistency'] > 0.9])
-    n_context = len(gen_df[gen_df['consistency'] < 0.7])
-    top_universal_act = gen_df[(gen_df['consistency'] > 0.9) & gen_df['is_activator']].head(3)
-    top_universal_rep = gen_df[(gen_df['consistency'] > 0.9) & ~gen_df['is_activator']].head(3)
-    
-    summary_text = f"""
-GENERALIZABILITY SUMMARY FOR {gene}
-{'='*40}
-
-Total TFs analyzed: {len(gen_df)}
-
-Universal (>90% consistent): {n_universal} TFs
-Context-specific (<70%): {n_context} TFs
-
-TOP UNIVERSAL ACTIVATORS:
-"""
-    for _, row in top_universal_act.iterrows():
-        summary_text += f"  • {row['tf']}: effect={row['effect']:.3f}, consistency={row['consistency']:.0%}\n"
-    
-    summary_text += "\nTOP UNIVERSAL REPRESSORS:\n"
-    for _, row in top_universal_rep.iterrows():
-        summary_text += f"  • {row['tf']}: effect={row['effect']:.3f}, consistency={row['consistency']:.0%}\n"
-    
-    summary_text += f"""
-RECOMMENDATION:
-Target TFs with BOTH high effect AND high
-generalizability for robust therapeutic effect
-across different patient cell populations.
-"""
-    
-    ax_j.text(0.05, 0.95, summary_text, transform=ax_j.transAxes,
-              fontsize=8, verticalalignment='top', fontfamily='monospace',
-              bbox=dict(boxstyle='round', facecolor=COLORS['background'], alpha=0.8))
-    
-    # =========================================================================
-    # Save figure
-    # =========================================================================
-    fig.suptitle(f'Figure 4: TF Generalizability Analysis for {gene}', 
-                fontsize=14, fontweight='bold', y=0.98)
-    
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    
-    # Save
-    fig.savefig(output_dir / 'figure4_generalizability.png', dpi=300, bbox_inches='tight',
-                facecolor='white', edgecolor='none')
-    fig.savefig(output_dir / 'figure4_generalizability.pdf', bbox_inches='tight',
-                facecolor='white', edgecolor='none')
-    plt.close()
-    
-    print(f"Saved Figure 4: {output_dir / 'figure4_generalizability.png'}")
-    
-    # Save generalizability CSV
-    gen_df.to_csv(output_dir / f'tf_generalizability_{gene}.csv', index=False)
-    print(f"Saved: tf_generalizability_{gene}.csv")
 
 
 # ============================================================================
@@ -2177,8 +1663,6 @@ def main():
                         help='Path to PPI directory (optional)')
     parser.add_argument('--jaspar', type=str, default=None,
                         help='Path to JASPAR specificity directory (optional)')
-    parser.add_argument('--finetune', type=str, default=None,
-                        help='Path to fine-tuned model directory (optional, from finetune_gene.py)')
     parser.add_argument('--output', type=str, required=True,
                         help='Output directory for figures and CSVs')
     
@@ -2199,8 +1683,7 @@ def main():
         gene=args.gene,
         singlecell_path=args.singlecell,
         ppi_dir=args.ppi,
-        jaspar_dir=args.jaspar if args.jaspar else (Path(args.model).parent.parent / 'data' / 'tf_specificity'),
-        finetune_dir=args.finetune
+        jaspar_dir=args.jaspar if args.jaspar else (Path(args.model).parent.parent / 'data' / 'tf_specificity')
     )
     
     print("\nGenerating figures...")
@@ -2209,7 +1692,6 @@ def main():
     create_figure1(analyzer, output_dir)
     create_figure2(analyzer, output_dir)
     create_figure3(analyzer, output_dir)
-    create_figure4(analyzer, output_dir)  # TF Generalizability Analysis
     
     print("\nSaving CSVs...")
     save_csvs(analyzer, output_dir)

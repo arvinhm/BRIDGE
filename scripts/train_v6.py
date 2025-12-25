@@ -771,7 +771,9 @@ class IntegratedGRNTrainer:
         )
         
         self.loss_fn = DeltaFocusedLoss(use_chip_reg=use_chip_reg)
-        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
+        # Use torch.cuda.amp for maximum compatibility
+        from torch.cuda.amp import GradScaler
+        self.scaler = GradScaler(enabled=self.use_amp)
         
     def train_epoch_multi_tf(
         self,
@@ -796,7 +798,8 @@ class IntegratedGRNTrainer:
             
             self.optimizer.zero_grad()
             
-            with torch.amp.autocast('cuda', enabled=self.use_amp):
+            from torch.cuda.amp import autocast
+            with autocast(enabled=self.use_amp):
                 pred_delta, grn_matrix = self.model.predict_delta_multi_tf(
                     tf_change, source_expr
                 )
@@ -861,7 +864,8 @@ class IntegratedGRNTrainer:
                 source_expr = batch['source_expression'].to(self.device)
                 actual_delta = batch['delta_expression'].to(self.device)
                 
-                with torch.amp.autocast('cuda', enabled=self.use_amp):
+                from torch.cuda.amp import autocast
+                with autocast(enabled=self.use_amp):
                     pred_delta, _ = self.model.predict_delta_multi_tf(
                         tf_change, source_expr
                     )

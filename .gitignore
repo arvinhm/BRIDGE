@@ -28,6 +28,10 @@ data/tf_binding/*.pkl
 data/tf_binding/*.csv
 data/ppi/*.npy
 data/tf_specificity/*.npy
+data/omnipath/*.npy
+data/omnipath/*.npz
+data/omnipath/*.csv
+data/omnipath/*.txt
 final_predictions/
 
 # Large CSV files

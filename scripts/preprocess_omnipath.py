@@ -432,6 +432,47 @@ def build_signaling_matrices(
     return gene_gene_adj, gene_tf_adj, tf_gene_adj_omnipath, tf_tf_adj_omnipath, stats
 
 
+def apply_topk_pruning(adj_matrix: np.ndarray, topk: int) -> np.ndarray:
+    """
+    Keep only top-k outgoing edges per source node (row) by absolute weight.
+    
+    This reduces memory usage and improves training stability by focusing
+    on the most important connections.
+    
+    Args:
+        adj_matrix: (n_source, n_target) adjacency matrix
+        topk: Number of edges to keep per source node
+        
+    Returns:
+        Pruned adjacency matrix with same shape
+    """
+    if topk is None or topk <= 0:
+        return adj_matrix
+    
+    n_source, n_target = adj_matrix.shape
+    
+    # Don't prune if matrix is smaller than topk
+    if n_target <= topk:
+        return adj_matrix
+    
+    pruned = np.zeros_like(adj_matrix)
+    
+    for i in range(n_source):
+        row = adj_matrix[i]
+        if np.count_nonzero(row) == 0:
+            continue
+        
+        # Get indices of top-k by absolute value
+        abs_row = np.abs(row)
+        if np.count_nonzero(abs_row) <= topk:
+            pruned[i] = row
+        else:
+            topk_indices = np.argsort(abs_row)[-topk:]
+            pruned[i, topk_indices] = row[topk_indices]
+    
+    return pruned
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -452,6 +493,8 @@ def main():
                         help='Maximum weight for edges')
     parser.add_argument('--saturation', type=int, default=10,
                         help='Reference count for weight saturation')
+    parser.add_argument('--topk-per-gene', type=int, default=None,
+                        help='Keep only top-k outgoing edges per gene (memory efficiency)')
     
     args = parser.parse_args()
     
@@ -537,6 +580,18 @@ def main():
         max_weight=args.max_weight,
         saturation=args.saturation
     )
+    
+    # Apply top-k pruning if specified (for memory efficiency)
+    if args.topk_per_gene:
+        print(f"\n  Applying top-k pruning (k={args.topk_per_gene})...")
+        orig_gg = np.count_nonzero(gene_gene_adj)
+        orig_gt = np.count_nonzero(gene_tf_adj)
+        
+        gene_gene_adj = apply_topk_pruning(gene_gene_adj, args.topk_per_gene)
+        gene_tf_adj = apply_topk_pruning(gene_tf_adj, args.topk_per_gene)
+        
+        print(f"    Gene->Gene: {orig_gg:,} -> {np.count_nonzero(gene_gene_adj):,} edges")
+        print(f"    Gene->TF: {orig_gt:,} -> {np.count_nonzero(gene_tf_adj):,} edges")
     
     # Save matrices
     print(f"\nSaving outputs to {output_dir}/...")
