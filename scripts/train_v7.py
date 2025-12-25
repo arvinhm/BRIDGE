@@ -90,15 +90,46 @@ from modules.perturbation import LINGERStyleGRN, PerturbationPredictor
 # OMNIPATH LOADING
 # =============================================================================
 
-def load_omnipath(omnipath_dir: str, n_genes: int, n_tfs: int) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
-    """Load OmniPath signaling matrices."""
+def load_omnipath(omnipath_dir: str, n_genes: int, n_tfs: int, 
+                   gene_names: List[str] = None, tf_names: List[str] = None) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Load OmniPath signaling matrices and align to expression gene order.
+    
+    The OmniPath matrices may be built from a subset of genes (mappings.pkl).
+    This function expands them to match the full expression gene list.
+    """
     opath = Path(omnipath_dir)
+    
+    # Try to load OmniPath gene order (from preprocessing)
+    omnipath_genes = None
+    mapping_path = opath / 'uniprot_to_gene_mapping.csv'
+    if mapping_path.exists() and gene_names is not None:
+        # Load the gene list used during OmniPath preprocessing
+        # Try to find the original gene list from mappings.pkl
+        mappings_pkl = opath.parent / 'tf_binding' / 'mappings.pkl'
+        if mappings_pkl.exists():
+            import pickle
+            with open(mappings_pkl, 'rb') as f:
+                mappings = pickle.load(f)
+            omnipath_genes = mappings.get('gene_names', None)
     
     # Gene→Gene signaling
     gene_gene_path = opath / 'gene_gene_signaling.npy'
     if gene_gene_path.exists():
-        gene_gene = np.load(gene_gene_path)
-        print(f"  Gene→Gene: {gene_gene.shape}, {np.count_nonzero(gene_gene):,} edges")
+        gene_gene_raw = np.load(gene_gene_path)
+        print(f"  Gene→Gene: {gene_gene_raw.shape}, {np.count_nonzero(gene_gene_raw):,} edges")
+        
+        # Expand to full gene list if needed
+        if gene_gene_raw.shape[0] != n_genes and omnipath_genes is not None and gene_names is not None:
+            gene_gene = _expand_gene_matrix(gene_gene_raw, omnipath_genes, gene_names)
+            print(f"    Expanded to {gene_gene.shape}")
+        elif gene_gene_raw.shape[0] != n_genes:
+            # Pad with zeros
+            gene_gene = np.zeros((n_genes, n_genes), dtype=np.float32)
+            min_g = min(gene_gene_raw.shape[0], n_genes)
+            gene_gene[:min_g, :min_g] = gene_gene_raw[:min_g, :min_g]
+            print(f"    Padded to {gene_gene.shape}")
+        else:
+            gene_gene = gene_gene_raw
     else:
         gene_gene = np.zeros((n_genes, n_genes), dtype=np.float32)
         print(f"  Gene→Gene: not found, using zeros")
@@ -106,8 +137,22 @@ def load_omnipath(omnipath_dir: str, n_genes: int, n_tfs: int) -> Tuple[np.ndarr
     # Gene→TF signaling
     gene_tf_path = opath / 'gene_tf_signaling.npy'
     if gene_tf_path.exists():
-        gene_tf = np.load(gene_tf_path)
-        print(f"  Gene→TF: {gene_tf.shape}, {np.count_nonzero(gene_tf):,} edges")
+        gene_tf_raw = np.load(gene_tf_path)
+        print(f"  Gene→TF: {gene_tf_raw.shape}, {np.count_nonzero(gene_tf_raw):,} edges")
+        
+        # Expand to full gene list if needed
+        if gene_tf_raw.shape[0] != n_genes and omnipath_genes is not None and gene_names is not None:
+            gene_tf = _expand_gene_tf_matrix(gene_tf_raw, omnipath_genes, gene_names, n_tfs)
+            print(f"    Expanded to {gene_tf.shape}")
+        elif gene_tf_raw.shape[0] != n_genes:
+            # Pad with zeros
+            gene_tf = np.zeros((n_genes, n_tfs), dtype=np.float32)
+            min_g = min(gene_tf_raw.shape[0], n_genes)
+            min_t = min(gene_tf_raw.shape[1], n_tfs)
+            gene_tf[:min_g, :min_t] = gene_tf_raw[:min_g, :min_t]
+            print(f"    Padded to {gene_tf.shape}")
+        else:
+            gene_tf = gene_tf_raw
     else:
         gene_tf = np.zeros((n_genes, n_tfs), dtype=np.float32)
         print(f"  Gene→TF: not found, using zeros")
@@ -121,6 +166,45 @@ def load_omnipath(omnipath_dir: str, n_genes: int, n_tfs: int) -> Tuple[np.ndarr
         tf_tf_omnipath = None
     
     return gene_gene, gene_tf, tf_tf_omnipath
+
+
+def _expand_gene_matrix(small_matrix: np.ndarray, small_genes: List[str], 
+                        full_genes: List[str]) -> np.ndarray:
+    """Expand a gene×gene matrix from small gene set to full gene set."""
+    n_full = len(full_genes)
+    expanded = np.zeros((n_full, n_full), dtype=np.float32)
+    
+    # Build mapping: small index → full index
+    full_genes_upper = [g.upper() for g in full_genes]
+    full_gene_to_idx = {g: i for i, g in enumerate(full_genes_upper)}
+    
+    for small_i, gene_i in enumerate(small_genes):
+        if gene_i.upper() in full_gene_to_idx:
+            full_i = full_gene_to_idx[gene_i.upper()]
+            for small_j, gene_j in enumerate(small_genes):
+                if gene_j.upper() in full_gene_to_idx:
+                    full_j = full_gene_to_idx[gene_j.upper()]
+                    expanded[full_i, full_j] = small_matrix[small_i, small_j]
+    
+    return expanded
+
+
+def _expand_gene_tf_matrix(small_matrix: np.ndarray, small_genes: List[str],
+                           full_genes: List[str], n_tfs: int) -> np.ndarray:
+    """Expand a gene×TF matrix from small gene set to full gene set."""
+    n_full = len(full_genes)
+    expanded = np.zeros((n_full, n_tfs), dtype=np.float32)
+    
+    # Build mapping: small index → full index
+    full_genes_upper = [g.upper() for g in full_genes]
+    full_gene_to_idx = {g: i for i, g in enumerate(full_genes_upper)}
+    
+    for small_i, gene_i in enumerate(small_genes):
+        if gene_i.upper() in full_gene_to_idx:
+            full_i = full_gene_to_idx[gene_i.upper()]
+            expanded[full_i, :] = small_matrix[small_i, :min(small_matrix.shape[1], n_tfs)]
+    
+    return expanded
 
 
 # =============================================================================
@@ -474,7 +558,8 @@ def main():
     print("\n[5/6] Loading OmniPath signaling network...")
     if args.omnipath:
         gene_gene, gene_tf, tf_tf_omnipath = load_omnipath(
-            args.omnipath, len(gene_names), len(tf_names)
+            args.omnipath, len(gene_names), len(tf_names),
+            gene_names=gene_names, tf_names=tf_names
         )
         # Blend TF-TF from ChIP and OmniPath
         if tf_tf_omnipath is not None:
