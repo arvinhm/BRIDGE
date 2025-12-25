@@ -222,6 +222,11 @@ def load_omnipath(filepath: str) -> pd.DataFrame:
         if col not in df.columns:
             raise ValueError(f"Missing required column: {col}")
     
+    # Robust boolean coercion (handles 'True', 'true', '1', 't', 'yes', etc.)
+    for col in ['is_stimulation', 'is_inhibition', 'is_directed']:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.lower().str.strip().isin(['true', '1', 't', 'yes'])
+    
     # Count edge types
     n_stimulation = df['is_stimulation'].sum() if 'is_stimulation' in df.columns else 0
     n_inhibition = df['is_inhibition'].sum() if 'is_inhibition' in df.columns else 0
@@ -398,28 +403,38 @@ def build_signaling_matrices(
         if idx % 50000 == 0 and idx > 0:
             print(f"    Processed {idx:,}/{len(omnipath_df):,} edges...")
     
-    # Convert to matrices
-    print(f"\nConverting to matrices...")
+    # Convert to matrices with duplicate handling
+    # For duplicates: keep max |w| with its sign (preserve strongest evidence)
+    print(f"\nConverting to matrices (aggregating duplicates by max |w|)...")
+    
+    def aggregate_edges_to_matrix(edges: list, shape: tuple, max_weight: float = 0.9) -> np.ndarray:
+        """Aggregate duplicate edges by keeping max absolute weight with sign."""
+        matrix = np.zeros(shape, dtype=np.float32)
+        
+        # Group by (src, tgt) and keep max |w|
+        edge_dict = {}
+        for src, tgt, w in edges:
+            key = (src, tgt)
+            if key not in edge_dict or abs(w) > abs(edge_dict[key]):
+                edge_dict[key] = w
+        
+        # Fill matrix
+        for (src, tgt), w in edge_dict.items():
+            matrix[src, tgt] = np.clip(w, -max_weight, max_weight)
+        
+        return matrix
     
     # Gene → Gene
-    gene_gene_adj = np.zeros((n_genes, n_genes), dtype=np.float32)
-    for src, tgt, w in gene_gene_edges:
-        gene_gene_adj[src, tgt] = w  # Note: overwrites if duplicate, could also add
+    gene_gene_adj = aggregate_edges_to_matrix(gene_gene_edges, (n_genes, n_genes), max_weight)
     
     # Gene → TF
-    gene_tf_adj = np.zeros((n_genes, n_tfs), dtype=np.float32)
-    for src, tgt, w in gene_tf_edges:
-        gene_tf_adj[src, tgt] = w
+    gene_tf_adj = aggregate_edges_to_matrix(gene_tf_edges, (n_genes, n_tfs), max_weight)
     
     # TF → Gene (from OmniPath, separate from ChIP-Atlas)
-    tf_gene_adj_omnipath = np.zeros((n_tfs, n_genes), dtype=np.float32)
-    for src, tgt, w in tf_gene_edges:
-        tf_gene_adj_omnipath[src, tgt] = w
+    tf_gene_adj_omnipath = aggregate_edges_to_matrix(tf_gene_edges, (n_tfs, n_genes), max_weight)
     
     # TF → TF (from OmniPath, to blend with existing)
-    tf_tf_adj_omnipath = np.zeros((n_tfs, n_tfs), dtype=np.float32)
-    for src, tgt, w in tf_tf_edges:
-        tf_tf_adj_omnipath[src, tgt] = w
+    tf_tf_adj_omnipath = aggregate_edges_to_matrix(tf_tf_edges, (n_tfs, n_tfs), max_weight)
     
     print(f"\nMatrix Statistics:")
     print(f"  Gene->Gene: {np.count_nonzero(gene_gene_adj):,} edges")

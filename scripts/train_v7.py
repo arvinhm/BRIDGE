@@ -480,7 +480,7 @@ class SignalingGRNTrainer(IntegratedGRNTrainer):
     - _compute_pcc
     - _compute_direction_accuracy
     
-    No changes needed - v7 model's predict_delta_multi_tf handles the new components.
+    ADDS: L2 prior penalty for OmniPath parameters to prevent drift from priors.
     """
     
     def __init__(
@@ -489,7 +489,8 @@ class SignalingGRNTrainer(IntegratedGRNTrainer):
         device: torch.device,
         learning_rate: float = 1e-3,
         use_amp: bool = True,
-        use_chip_reg: bool = True
+        use_chip_reg: bool = True,
+        prior_penalty_weight: float = 0.01  # L2 penalty weight for OmniPath priors
     ):
         # Call parent constructor EXACTLY
         super().__init__(
@@ -499,6 +500,114 @@ class SignalingGRNTrainer(IntegratedGRNTrainer):
             use_amp=use_amp,
             use_chip_reg=use_chip_reg
         )
+        self.prior_penalty_weight = prior_penalty_weight
+    
+    def compute_prior_penalty(self) -> torch.Tensor:
+        """
+        Compute L2 prior penalty for OmniPath parameters.
+        
+        Prevents learned weights from drifting too far from priors:
+        - gene_propagation should stay close to 0.5 * gene_gene_prior
+        - gene_to_tf should stay close to 0.5 * gene_tf_prior.T
+        
+        Returns:
+            penalty: Scalar loss to add to total loss
+        """
+        penalty = torch.tensor(0.0, device=self.device)
+        
+        model = self.model
+        
+        # Gene→Gene propagation penalty
+        if hasattr(model, 'gene_propagation') and hasattr(model, 'gene_gene_prior'):
+            target = 0.5 * model.gene_gene_prior
+            diff = model.gene_propagation - target
+            # Use mean to normalize by matrix size
+            penalty = penalty + (diff ** 2).mean()
+        
+        # Gene→TF modulation penalty
+        if hasattr(model, 'gene_to_tf') and hasattr(model, 'gene_tf_prior'):
+            target = 0.5 * model.gene_tf_prior.T
+            diff = model.gene_to_tf - target
+            penalty = penalty + (diff ** 2).mean()
+        
+        return self.prior_penalty_weight * penalty
+    
+    def train_epoch_multi_tf(
+        self,
+        dataloader: DataLoader,
+        epoch: int
+    ) -> Dict[str, float]:
+        """
+        Training epoch for v7 model.
+        
+        Overrides parent to add L2 prior penalty for OmniPath parameters.
+        """
+        self.model.train()
+        
+        total_loss = 0.0
+        total_mse = 0.0
+        total_prior = 0.0
+        all_pred_deltas = []
+        all_actual_deltas = []
+        
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch:3d}")
+        
+        for batch in pbar:
+            tf_change = batch['tf_activity_change'].to(self.device)
+            source_expr = batch['source_expression'].to(self.device)
+            actual_delta = batch['delta_expression'].to(self.device)
+            
+            self.optimizer.zero_grad()
+            
+            from torch.cuda.amp import autocast
+            with autocast(enabled=self.use_amp):
+                pred_delta, grn_matrix = self.model.predict_delta_multi_tf(
+                    tf_change, source_expr
+                )
+                
+                losses = self.loss_fn(pred_delta, actual_delta)
+                
+                # Add L2 prior penalty (NEW in v7)
+                prior_penalty = self.compute_prior_penalty()
+                total_loss_batch = losses['total'] + prior_penalty
+            
+            if self.use_amp:
+                self.scaler.scale(total_loss_batch).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                total_loss_batch.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+            
+            total_loss += losses['total'].item()
+            total_mse += losses['mse'].item()
+            total_prior += prior_penalty.item()
+            
+            if len(all_pred_deltas) < 50:
+                all_pred_deltas.append(pred_delta.detach().cpu())
+                all_actual_deltas.append(actual_delta.detach().cpu())
+            
+            pbar.set_postfix({
+                'loss': f'{losses["total"].item():.4f}',
+                'prior': f'{prior_penalty.item():.4f}'
+            })
+        
+        # Compute metrics
+        n_batches = len(dataloader)
+        all_pred = torch.cat(all_pred_deltas, dim=0)
+        all_actual = torch.cat(all_actual_deltas, dim=0)
+        
+        delta_pcc = self._batch_correlation(all_pred, all_actual)
+        
+        return {
+            'loss': total_loss / n_batches,
+            'mse': total_mse / n_batches,
+            'prior_penalty': total_prior / n_batches,
+            'delta_pcc': delta_pcc
+        }
 
 
 # =============================================================================
