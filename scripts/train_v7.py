@@ -66,14 +66,17 @@ from scripts.train_v6 import (
     compute_tf_activity_linger,
     compute_baseline_metrics,
     
-    # Model
+    # Model - THE CORE ARCHITECTURE
     IntegratedGRNModel,
     
     # Dataset
     MultiTFDataset,
     
-    # Training
+    # Loss function
     DeltaFocusedLoss,
+    
+    # Trainer - USE EXACT SAME TRAINER
+    IntegratedGRNTrainer,
 )
 
 # Import sophisticated model components
@@ -300,8 +303,10 @@ class IntegratedGRNModelV7(IntegratedGRNModel):
         Predict expression CHANGE with full signaling network.
         
         EXTENDS parent method with:
-        1. Gene→TF modulation (upstream regulation)
-        2. Gene→Gene propagation (signaling cascades)
+        1. Gene→TF modulation BEFORE parent call (upstream regulation)
+        2. Gene→Gene propagation AFTER parent call (signaling cascades)
+        
+        Uses EXACT same core computation as IntegratedGRNModel.predict_delta_multi_tf
         
         Args:
             tf_activity_change: (batch, n_tfs) - change in activity for ALL TFs
@@ -311,63 +316,35 @@ class IntegratedGRNModelV7(IntegratedGRNModel):
             predicted_delta: (batch, n_genes)
             grn_matrix: (n_genes, n_tfs)
         """
-        batch_size = tf_activity_change.size(0)
-        device = tf_activity_change.device
-        
         # ============================================================
-        # Step 1: Gene→TF Modulation (NEW in v7)
+        # Step 1: Gene→TF Modulation (NEW in v7 - BEFORE parent call)
         # ============================================================
-        if source_expression is not None:
+        if self.use_gene_tf_modulation and source_expression is not None:
             tf_modulation = self.compute_gene_tf_modulation(source_expression)
             tf_activity_modulated = tf_activity_change * tf_modulation
         else:
             tf_activity_modulated = tf_activity_change
         
         # ============================================================
-        # Step 2: Standard v6 delta prediction (TF→Gene)
+        # Step 2: Call PARENT's predict_delta_multi_tf - EXACT v6 code
         # ============================================================
-        # Get GRN matrix
-        grn_matrix = self.get_grn_matrix()  # (n_genes, n_tfs)
-        
-        # Basic delta = TF_change @ GRN
-        delta_basic = torch.mm(tf_activity_modulated, grn_matrix.T)  # (batch, n_genes)
-        
-        # Context gating (from v6)
-        if self.use_context_gating and source_expression is not None:
-            # Encode cell state
-            cell_outputs = self.cell_encoder(source_expression)
-            cell_emb = cell_outputs['cell_embedding']
-            
-            # Combine TF change with cell embedding
-            combined = torch.cat([tf_activity_modulated, cell_emb], dim=-1)
-            delta_neural = self.delta_decoder(combined)
-            
-            # FiLM modulation
-            context = self.context_encoder(source_expression)
-            gamma = self.context_gate(context)
-            beta = self.context_shift(context) * 0.1
-            
-            # Blend basic and neural
-            delta_gated = gamma * delta_basic + beta
-            delta_combined = 0.7 * delta_gated + 0.3 * delta_neural
-        else:
-            delta_combined = delta_basic
+        # This calls IntegratedGRNModel.predict_delta_multi_tf with:
+        # - Same GRN computation
+        # - Same context gating (FiLM)
+        # - Same cofactor gate
+        # - Same delta_basic + delta_neural blending
+        delta, grn_matrix = super().predict_delta_multi_tf(
+            tf_activity_modulated, 
+            source_expression
+        )
         
         # ============================================================
-        # Step 3: Gene→Gene Propagation (NEW in v7)
+        # Step 3: Gene→Gene Propagation (NEW in v7 - AFTER parent call)
         # ============================================================
-        delta_propagated = self.compute_gene_propagation(delta_combined)
+        if self.use_gene_propagation:
+            delta = self.compute_gene_propagation(delta)
         
-        # Cofactor gating (from v6)
-        if hasattr(self, 'cof_to_tf_adj') and self.cof_to_tf_adj is not None and source_expression is not None:
-            cofactor_expr = source_expression[:, self.cofactor_gene_indices.long()]
-            cofactor_influence = torch.mm(cofactor_expr, self.cof_to_tf_adj)
-            cofactor_gate = 1.0 + 0.2 * torch.tanh(cofactor_influence / 5.0)
-            
-            # Apply cofactor modulation
-            delta_propagated = delta_propagated * cofactor_gate.mean(dim=1, keepdim=True)
-        
-        return delta_propagated, grn_matrix
+        return delta, grn_matrix
     
     def get_signaling_networks(self) -> Dict[str, torch.Tensor]:
         """Get all learned signaling networks for analysis."""
@@ -387,140 +364,39 @@ class IntegratedGRNModelV7(IntegratedGRNModel):
 
 
 # =============================================================================
-# TRAINER - EXTENDS train_v6 trainer logic
+# TRAINER - INHERITS EXACTLY FROM train_v6 IntegratedGRNTrainer
 # =============================================================================
 
-class SignalingGRNTrainer:
-    """Trainer for v7 model - same as v6 with additional metrics."""
+class SignalingGRNTrainer(IntegratedGRNTrainer):
+    """
+    Trainer for v7 model.
+    
+    INHERITS ALL functionality from IntegratedGRNTrainer (train_v6):
+    - train_epoch_multi_tf
+    - validate_multi_tf
+    - _batch_correlation
+    - _compute_pcc
+    - _compute_direction_accuracy
+    
+    No changes needed - v7 model's predict_delta_multi_tf handles the new components.
+    """
     
     def __init__(
         self,
         model: IntegratedGRNModelV7,
         device: torch.device,
-        lr: float = 1e-3,
-        weight_decay: float = 0.01,
-        use_amp: bool = True
+        learning_rate: float = 1e-3,
+        use_amp: bool = True,
+        use_chip_reg: bool = True
     ):
-        self.model = model.to(device)
-        self.device = device
-        self.use_amp = use_amp and device.type == 'cuda'
-        
-        # Optimizer
-        self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer, T_0=10, T_mult=2
+        # Call parent constructor EXACTLY
+        super().__init__(
+            model=model,
+            device=device,
+            learning_rate=learning_rate,
+            use_amp=use_amp,
+            use_chip_reg=use_chip_reg
         )
-        
-        # AMP scaler
-        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
-        
-        # Loss function (from v6)
-        self.criterion = DeltaFocusedLoss(
-            delta_weight=1.0,
-            direction_weight=0.3,
-            sparsity_weight=0.001,
-            use_chip_reg=True
-        )
-        
-    def train_epoch(self, train_loader: DataLoader, epoch: int) -> Dict[str, float]:
-        """Train one epoch."""
-        self.model.train()
-        
-        epoch_metrics = {
-            'loss': 0.0,
-            'delta_corr': 0.0,
-            'dir_acc': 0.0
-        }
-        n_batches = 0
-        
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch:3d}")
-        
-        for batch in pbar:
-            tf_change = batch['tf_activity_change'].to(self.device)
-            source_expr = batch['source_expression'].to(self.device)
-            target_delta = batch['target_delta'].to(self.device)
-            
-            self.optimizer.zero_grad()
-            
-            with torch.amp.autocast('cuda', enabled=self.use_amp):
-                pred_delta, grn = self.model.predict_delta_multi_tf(tf_change, source_expr)
-                
-                loss, loss_dict = self.criterion(
-                    pred_delta, target_delta, grn, self.model.chip_mask
-                )
-            
-            if self.scaler:
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
-            
-            epoch_metrics['loss'] += loss.item()
-            epoch_metrics['delta_corr'] += loss_dict.get('delta_pcc', 0.0)
-            epoch_metrics['dir_acc'] += loss_dict.get('dir_acc', 0.0)
-            n_batches += 1
-            
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
-        
-        self.scheduler.step()
-        
-        # Average metrics
-        for k in epoch_metrics:
-            epoch_metrics[k] /= max(n_batches, 1)
-        
-        return epoch_metrics
-    
-    @torch.no_grad()
-    def validate(self, val_loader: DataLoader) -> Dict[str, float]:
-        """Validate model."""
-        self.model.eval()
-        
-        all_pred = []
-        all_actual = []
-        
-        for batch in val_loader:
-            tf_change = batch['tf_activity_change'].to(self.device)
-            source_expr = batch['source_expression'].to(self.device)
-            target_delta = batch['target_delta'].to(self.device)
-            
-            pred_delta, _ = self.model.predict_delta_multi_tf(tf_change, source_expr)
-            
-            all_pred.append(pred_delta.cpu())
-            all_actual.append(target_delta.cpu())
-        
-        if len(all_pred) == 0:
-            return {'delta_pcc': 0.0, 'dir_acc': 0.0}
-        
-        all_pred = torch.cat(all_pred).numpy()
-        all_actual = torch.cat(all_actual).numpy()
-        
-        # Overall correlation
-        pred_flat = all_pred.flatten()
-        actual_flat = all_actual.flatten()
-        
-        if np.std(pred_flat) > 1e-6 and np.std(actual_flat) > 1e-6:
-            delta_pcc, _ = scipy_stats.pearsonr(pred_flat, actual_flat)
-        else:
-            delta_pcc = 0.0
-        
-        # Direction accuracy
-        pred_sign = np.sign(pred_flat)
-        actual_sign = np.sign(actual_flat)
-        significant = np.abs(actual_flat) > np.std(actual_flat) * 0.1
-        if np.sum(significant) > 0:
-            dir_acc = np.mean(pred_sign[significant] == actual_sign[significant])
-        else:
-            dir_acc = 0.5
-        
-        return {
-            'delta_pcc': float(delta_pcc),
-            'dir_acc': float(dir_acc),
-        }
 
 
 # =============================================================================
@@ -693,19 +569,21 @@ def main():
     print("=" * 70)
     print(f"  Baselines to beat: Source-Target PCC={baselines['source_target_pcc']:.4f}")
     
-    trainer = SignalingGRNTrainer(model, device, lr=args.lr)
+    trainer = SignalingGRNTrainer(model, device, learning_rate=args.lr)
     
     best_delta_pcc = -1
     best_epoch = 0
     
     for epoch in range(1, args.epochs + 1):
-        train_metrics = trainer.train_epoch(train_loader, epoch)
+        # Use train_epoch_multi_tf from parent class (IntegratedGRNTrainer)
+        train_metrics = trainer.train_epoch_multi_tf(train_loader, epoch)
         
         print(f"Epoch {epoch:3d}: loss={train_metrics['loss']:.4f} "
-              f"delta={train_metrics['delta_corr']:.3f} dir={train_metrics['dir_acc']:.3f}")
+              f"delta={train_metrics.get('delta_pcc', 0):.3f} dir={train_metrics.get('dir_acc', 0):.3f}")
         
         if epoch % args.val_every == 0 or epoch == 1:
-            val_metrics = trainer.validate(val_loader)
+            # Use validate_multi_tf from parent class (IntegratedGRNTrainer)
+            val_metrics = trainer.validate_multi_tf(val_loader)
             print(f"  [VAL] Delta_PCC={val_metrics['delta_pcc']:.4f} Dir_Acc={val_metrics['dir_acc']:.4f}")
             
             if val_metrics['delta_pcc'] > best_delta_pcc:
