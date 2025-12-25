@@ -510,6 +510,8 @@ class SignalingGRNTrainer(IntegratedGRNTrainer):
         - gene_propagation should stay close to 0.5 * gene_gene_prior
         - gene_to_tf should stay close to 0.5 * gene_tf_prior.T
         
+        Only penalizes non-zero prior entries (sparse-aware).
+        
         Returns:
             penalty: Scalar loss to add to total loss
         """
@@ -517,18 +519,26 @@ class SignalingGRNTrainer(IntegratedGRNTrainer):
         
         model = self.model
         
-        # Gene→Gene propagation penalty
+        # Gene→Gene propagation penalty (sparse-aware)
         if hasattr(model, 'gene_propagation') and hasattr(model, 'gene_gene_prior'):
-            target = 0.5 * model.gene_gene_prior
+            prior = model.gene_gene_prior
+            target = 0.5 * prior
             diff = model.gene_propagation - target
-            # Use mean to normalize by matrix size
-            penalty = penalty + (diff ** 2).mean()
+            
+            # Only penalize where prior is non-zero (sparse-aware)
+            mask = (prior != 0)
+            if mask.sum() > 0:
+                penalty = penalty + (diff[mask] ** 2).mean()
         
-        # Gene→TF modulation penalty
+        # Gene→TF modulation penalty (sparse-aware)
         if hasattr(model, 'gene_to_tf') and hasattr(model, 'gene_tf_prior'):
-            target = 0.5 * model.gene_tf_prior.T
+            prior = model.gene_tf_prior.T
+            target = 0.5 * prior
             diff = model.gene_to_tf - target
-            penalty = penalty + (diff ** 2).mean()
+            
+            mask = (prior != 0)
+            if mask.sum() > 0:
+                penalty = penalty + (diff[mask] ** 2).mean()
         
         return self.prior_penalty_weight * penalty
     
