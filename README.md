@@ -1,3 +1,9 @@
+# BRIDGE: Complete Molecular Signaling Network Inference
+
+**B**iological **R**egulatory **I**nference via **D**eep **G**raph **E**ncoding
+
+---
+
 # SingleCell-GRN: Nature-Level Gene Regulatory Network Inference
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -262,6 +268,102 @@ Edge-by-Edge Analysis:
 | 75-95% | 🟡 Medium | Moderate effect, reasonably confident |
 | 50-75% | 🟠 Low | Weak effect, less confident |
 | < 50% | 🔴 Very Low | Near-zero effect, likely noise |
+
+---
+
+## 🆕 BRIDGE 2.0: Full Molecular Signaling Network
+
+BRIDGE 2.0 extends beyond TF→Gene to include the **complete signaling network**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    BRIDGE 2.0: COMPLETE SIGNALING                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Gene ──activates──→ Gene ──inhibits──→ TF ──upregulates──→ Gene            │
+│    ↑                   ↓                ↑                    ↓              │
+│    └───────feedback────┴────cascade────┴────expression────┘                │
+│                                                                              │
+│  NEW DATA: OmniPath Signaling                                               │
+│  • 292,000 protein-protein interactions                                     │
+│  • Gene→Gene signaling cascades                                             │
+│  • Gene→TF upstream regulation (previously unknown!)                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### New Edge Types:
+
+| Edge Type | Source | Direction | Example |
+|-----------|--------|-----------|---------|
+| TF→Gene | ChIP-Atlas | Expression | REST ⊣ SSTR2 |
+| TF→TF | ChIP-Atlas | Cascade | ASCL1 → NEUROD1 |
+| **Gene→Gene** | OmniPath | **Signaling** | **RAS → RAF → MEK** |
+| **Gene→TF** | OmniPath | **Upstream** | **Growth factor → TF activation** |
+
+### BRIDGE 2.0 Workflow:
+
+```bash
+# Step 1: Preprocess OmniPath signaling network
+python scripts/preprocess_omnipath.py \
+    --input omnipath_all_signaling_edges.tsv \
+    --output data/omnipath/ \
+    --gene-list data/tf_binding/mappings.pkl
+
+# Step 2: Train full signaling model (train_v7)
+python scripts/train_v7.py \
+    --singlecell data/sclc/preprocessed.h5ad \
+    --tf-binding data/tf_binding/ \
+    --omnipath data/omnipath/ \
+    --ppi data/ppi/ \
+    --output results/sclc_v7/ \
+    --epochs 100
+
+# Step 3: Discovery mode - find novel regulators!
+python scripts/discover_regulators.py \
+    --gene SSTR2 \
+    --model results/sclc_v7/ \
+    --singlecell data/sclc/preprocessed.h5ad \
+    --omnipath data/omnipath/ \
+    --output results/discovery_SSTR2/
+```
+
+### Discovery Mode 🔬
+
+Phase 2 explores **novel regulatory connections** not in known databases:
+
+```
+Phase 1: Train on known network (OmniPath + ChIP)
+         ↓
+Phase 2: Query target gene (e.g., SSTR2)
+         ↓
+         KNOWN: REST ⊣ SSTR2 (in database, high confidence)
+         LEARNED: NEUROD1 → SSTR2 (from expression data)
+         ↓
+Phase 3: DISCOVERY - Expand neighborhood
+         ↓
+         NOVEL: Gene_X → TF_Y → SSTR2 (NEW DISCOVERY!)
+         (Not in OmniPath, but supported by expression patterns)
+```
+
+**Discovery Output:**
+- `known_regulators_SSTR2.csv` - All known + learned regulators
+- `novel_discoveries_SSTR2.csv` - Novel candidates with confidence scores
+- `discovery_report_SSTR2.png` - 6-panel visualization
+
+### OmniPath Edge Weighting:
+
+Edges are weighted by number of literature references with saturation:
+
+```python
+weight = 0.5 + 0.5 * (1 - exp(-references / 10))
+
+# 0 refs → 0.5 (base weight)
+# 10 refs → 0.82
+# 50 refs → 0.99 (approaching max)
+```
+
+This prevents highly-cited edges from overwhelming less-studied connections.
 
 ---
 
