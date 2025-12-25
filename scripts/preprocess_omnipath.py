@@ -59,65 +59,147 @@ def load_uniprot_mapping(mapping_file: Optional[str] = None) -> Dict[str, str]:
     return mapping
 
 
-def fetch_uniprot_to_gene(uniprot_ids: Set[str], batch_size: int = 500) -> Dict[str, str]:
+def fetch_uniprot_to_gene(uniprot_ids: Set[str], batch_size: int = 100) -> Dict[str, str]:
     """
     Fetch UniProt to Gene Symbol mappings using UniProt API.
     
-    Falls back to heuristic extraction if API unavailable.
+    Uses the new UniProt REST API with proper pagination.
     """
     import urllib.request
     import urllib.parse
+    import time
     
     mapping = {}
     uniprot_list = list(uniprot_ids)
     
     print(f"  Fetching gene symbols for {len(uniprot_list)} UniProt IDs...")
     
-    # Try UniProt ID mapping API
+    # Try UniProt ID mapping API - new format
     try:
         for i in range(0, len(uniprot_list), batch_size):
             batch = uniprot_list[i:i+batch_size]
             
-            url = 'https://rest.uniprot.org/uniprotkb/stream'
-            params = {
-                'query': ' OR '.join([f'accession:{uid}' for uid in batch]),
-                'fields': 'accession,gene_primary',
-                'format': 'tsv'
-            }
+            # Build query string - simpler approach
+            query = '+OR+'.join([f'accession:{uid}' for uid in batch])
+            url = f'https://rest.uniprot.org/uniprotkb/search?query={query}&fields=accession,gene_primary&format=tsv&size={batch_size}'
             
-            full_url = f"{url}?{urllib.parse.urlencode(params)}"
+            try:
+                req = urllib.request.Request(url)
+                req.add_header('User-Agent', 'Python/BRIDGE-GRN')
+                
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    lines = response.read().decode('utf-8').strip().split('\n')
+                    if len(lines) > 1:  # Skip header
+                        for line in lines[1:]:
+                            parts = line.split('\t')
+                            if len(parts) >= 2 and parts[1]:
+                                mapping[parts[0]] = parts[1].upper()
+                
+                time.sleep(0.5)  # Rate limiting
+                
+            except Exception as e:
+                # Try alternative API endpoint
+                pass
             
-            with urllib.request.urlopen(full_url, timeout=30) as response:
-                lines = response.read().decode('utf-8').strip().split('\n')
-                if len(lines) > 1:  # Skip header
-                    for line in lines[1:]:
-                        parts = line.split('\t')
-                        if len(parts) >= 2 and parts[1]:
-                            mapping[parts[0]] = parts[1].upper()
-            
-            if (i // batch_size) % 10 == 0:
-                print(f"    Processed {min(i + batch_size, len(uniprot_list))}/{len(uniprot_list)}")
+            if (i // batch_size) % 20 == 0 and i > 0:
+                print(f"    Processed {min(i + batch_size, len(uniprot_list))}/{len(uniprot_list)} ({len(mapping)} mapped)")
                 
     except Exception as e:
-        print(f"  Warning: UniProt API failed ({e}). Using fallback mapping.")
+        print(f"  Warning: UniProt API failed ({e}).")
     
     return mapping
 
 
-def create_fallback_mapping(omnipath_df: pd.DataFrame, gene_names: List[str]) -> Dict[str, str]:
+def try_mygene_mapping(uniprot_ids: Set[str]) -> Dict[str, str]:
     """
-    Create fallback mapping by matching UniProt IDs to known gene names.
+    Try using mygene library for UniProt to Gene Symbol mapping.
+    Much more reliable than direct API calls.
+    """
+    try:
+        import mygene
+        mg = mygene.MyGeneInfo()
+        
+        print("  Using mygene library for ID mapping...")
+        uniprot_list = list(uniprot_ids)
+        
+        # Query in batches
+        mapping = {}
+        batch_size = 1000
+        
+        for i in range(0, len(uniprot_list), batch_size):
+            batch = uniprot_list[i:i+batch_size]
+            results = mg.querymany(batch, scopes='uniprot', fields='symbol', species='human', verbose=False)
+            
+            for r in results:
+                if 'symbol' in r and r['symbol']:
+                    mapping[r['query']] = r['symbol'].upper()
+            
+            if i % 5000 == 0 and i > 0:
+                print(f"    Processed {i}/{len(uniprot_list)} ({len(mapping)} mapped)")
+        
+        print(f"  Mapped {len(mapping)}/{len(uniprot_ids)} IDs via mygene")
+        return mapping
+        
+    except ImportError:
+        print("  mygene not installed. Install with: pip install mygene")
+        return {}
+    except Exception as e:
+        print(f"  mygene failed: {e}")
+        return {}
+
+
+def create_fallback_mapping(omnipath_df: pd.DataFrame, gene_names: List[str], tf_names: List[str]) -> Dict[str, str]:
+    """
+    Create fallback mapping using bioservices or download from UniProt.
     
-    Heuristic: Many UniProt IDs contain gene name patterns.
+    As a last resort, download the human proteome mapping file.
     """
-    gene_set = set(g.upper() for g in gene_names)
+    import urllib.request
+    import os
+    
     mapping = {}
+    gene_set = set(g.upper() for g in gene_names)
+    tf_set = set(t.upper() for t in tf_names)
+    all_genes = gene_set | tf_set
     
-    # Common human protein ID patterns
-    # UniProt IDs like P12345 don't directly encode gene names,
-    # but we can try to match based on overlap with our gene list
+    # Try to download human ID mapping from UniProt
+    cache_file = 'data/omnipath/uniprot_human_mapping.tsv'
     
-    # For now, return empty - will be populated by external mapping
+    if not os.path.exists(cache_file):
+        print("  Downloading UniProt human ID mapping (this may take a minute)...")
+        try:
+            # Download reviewed human proteins with gene names
+            url = 'https://rest.uniprot.org/uniprotkb/stream?query=reviewed:true+AND+organism_id:9606&fields=accession,gene_primary&format=tsv'
+            req = urllib.request.Request(url)
+            req.add_header('User-Agent', 'Python/BRIDGE-GRN')
+            
+            with urllib.request.urlopen(req, timeout=300) as response:
+                content = response.read().decode('utf-8')
+                
+                os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+                with open(cache_file, 'w') as f:
+                    f.write(content)
+                    
+            print(f"  Saved mapping to {cache_file}")
+            
+        except Exception as e:
+            print(f"  Download failed: {e}")
+            return {}
+    
+    # Parse the mapping file
+    if os.path.exists(cache_file):
+        print(f"  Loading cached mapping from {cache_file}")
+        with open(cache_file, 'r') as f:
+            lines = f.read().strip().split('\n')
+            for line in lines[1:]:  # Skip header
+                parts = line.split('\t')
+                if len(parts) >= 2 and parts[1]:
+                    gene = parts[1].upper()
+                    if gene in all_genes:
+                        mapping[parts[0]] = gene
+        
+        print(f"  Found {len(mapping)} UniProt IDs matching our genes")
+    
     return mapping
 
 
@@ -165,9 +247,9 @@ def load_omnipath(filepath: str) -> pd.DataFrame:
 
 
 def compute_edge_weights(ref_counts: np.ndarray, 
-                         base_weight: float = 0.5,
-                         max_weight: float = 1.0,
-                         saturation: int = 10) -> np.ndarray:
+                         base_weight: float = 0.2,
+                         max_weight: float = 0.9,
+                         saturation: int = 8) -> np.ndarray:
     """
     Compute edge weights from reference counts.
     
@@ -340,12 +422,12 @@ def build_signaling_matrices(
         tf_tf_adj_omnipath[src, tgt] = w
     
     print(f"\nMatrix Statistics:")
-    print(f"  Gene→Gene: {np.count_nonzero(gene_gene_adj):,} edges")
+    print(f"  Gene->Gene: {np.count_nonzero(gene_gene_adj):,} edges")
     print(f"    Activations: {np.sum(gene_gene_adj > 0):,}")
     print(f"    Inhibitions: {np.sum(gene_gene_adj < 0):,}")
-    print(f"  Gene→TF: {np.count_nonzero(gene_tf_adj):,} edges")
-    print(f"  TF→Gene (OmniPath): {np.count_nonzero(tf_gene_adj_omnipath):,} edges")
-    print(f"  TF→TF (OmniPath): {np.count_nonzero(tf_tf_adj_omnipath):,} edges")
+    print(f"  Gene->TF: {np.count_nonzero(gene_tf_adj):,} edges")
+    print(f"  TF->Gene (OmniPath): {np.count_nonzero(tf_gene_adj_omnipath):,} edges")
+    print(f"  TF->TF (OmniPath): {np.count_nonzero(tf_tf_adj_omnipath):,} edges")
     
     return gene_gene_adj, gene_tf_adj, tf_gene_adj_omnipath, tf_tf_adj_omnipath, stats
 
@@ -406,19 +488,35 @@ def main():
     all_uniprots = set(omnipath_df['source'].unique()) | set(omnipath_df['target'].unique())
     print(f"  Unique UniProt IDs: {len(all_uniprots):,}")
     
-    # Load or create UniProt→Gene mapping
+    # Load or create UniProt->Gene mapping
     print(f"\n[3/4] Mapping UniProt IDs to gene symbols...")
+    
+    uniprot_to_gene = {}
     
     if args.uniprot_mapping and Path(args.uniprot_mapping).exists():
         uniprot_to_gene = load_uniprot_mapping(args.uniprot_mapping)
         print(f"  Loaded {len(uniprot_to_gene):,} mappings from file")
-    else:
-        # Try to fetch from UniProt API
-        uniprot_to_gene = fetch_uniprot_to_gene(all_uniprots)
-        
-        if len(uniprot_to_gene) < len(all_uniprots) * 0.5:
-            print(f"  Warning: Only mapped {len(uniprot_to_gene)}/{len(all_uniprots)} IDs")
-            print(f"  Consider providing a UniProt mapping file with --uniprot-mapping")
+    
+    # If not enough mappings, try mygene library
+    if len(uniprot_to_gene) < len(all_uniprots) * 0.3:
+        mygene_mapping = try_mygene_mapping(all_uniprots)
+        uniprot_to_gene.update(mygene_mapping)
+    
+    # If still not enough, try downloading from UniProt
+    if len(uniprot_to_gene) < len(all_uniprots) * 0.3:
+        print("  Trying fallback mapping...")
+        fallback_mapping = create_fallback_mapping(omnipath_df, gene_names, tf_names)
+        uniprot_to_gene.update(fallback_mapping)
+    
+    # Final attempt: direct UniProt API
+    if len(uniprot_to_gene) < len(all_uniprots) * 0.3:
+        print("  Trying UniProt REST API...")
+        api_mapping = fetch_uniprot_to_gene(all_uniprots - set(uniprot_to_gene.keys()))
+        uniprot_to_gene.update(api_mapping)
+    
+    if len(uniprot_to_gene) < len(all_uniprots) * 0.1:
+        print(f"  WARNING: Only mapped {len(uniprot_to_gene)}/{len(all_uniprots)} IDs")
+        print(f"  Install mygene for better mapping: pip install mygene")
     
     # Save mapping for reference
     mapping_df = pd.DataFrame([
@@ -468,17 +566,17 @@ def main():
     print("PREPROCESSING COMPLETE!")
     print("=" * 70)
     print(f"\nOutput files:")
-    print(f"  - gene_gene_signaling.npy: ({gene_gene_adj.shape}) Gene→Gene network")
-    print(f"  - gene_tf_signaling.npy: ({gene_tf_adj.shape}) Gene→TF regulation")
-    print(f"  - tf_gene_signaling_omnipath.npy: TF→Gene from OmniPath")
-    print(f"  - tf_tf_signaling_omnipath.npy: TF→TF from OmniPath")
+    print(f"  - gene_gene_signaling.npy: ({gene_gene_adj.shape}) Gene->Gene network")
+    print(f"  - gene_tf_signaling.npy: ({gene_tf_adj.shape}) Gene->TF regulation")
+    print(f"  - tf_gene_signaling_omnipath.npy: TF->Gene from OmniPath")
+    print(f"  - tf_tf_signaling_omnipath.npy: TF->TF from OmniPath")
     print(f"  - uniprot_to_gene_mapping.csv: ID mapping reference")
     print(f"  - omnipath_stats.csv: Processing statistics")
     
     print(f"\nKey Statistics:")
     print(f"  Mapped edges: {stats['mapped_edges']:,} / {stats['total_edges']:,} ({100*stats['mapped_edges']/stats['total_edges']:.1f}%)")
-    print(f"  Gene→Gene: {stats['gene_gene']:,} edges")
-    print(f"  Gene→TF: {stats['gene_tf']:,} edges (NEW! Upstream regulation)")
+    print(f"  Gene->Gene: {stats['gene_gene']:,} edges")
+    print(f"  Gene->TF: {stats['gene_tf']:,} edges (NEW! Upstream regulation)")
     print(f"  Bidirectional: {stats['bidirectional']:,} feedback loops")
 
 

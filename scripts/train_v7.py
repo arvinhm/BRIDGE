@@ -326,13 +326,24 @@ class IntegratedGRNModelV7(IntegratedGRNModel):
             tf_activity_modulated = tf_activity_change
         
         # ============================================================
+        # Step 1b: Cofactor gating per-TF (BEFORE GRN multiplication)
+        # This modulates TF activity based on cofactor expression
+        # ============================================================
+        if hasattr(self, 'cof_to_tf_adj') and self.cof_to_tf_adj is not None and source_expression is not None:
+            cofactor_expr = source_expression[:, self.cofactor_gene_indices.long()]  # (B, n_cof)
+            cofactor_influence = torch.mm(cofactor_expr, self.cof_to_tf_adj)         # (B, n_tfs)
+            cofactor_gate = 1.0 + 0.2 * torch.tanh(cofactor_influence / 5.0)         # (B, n_tfs)
+            tf_activity_modulated = tf_activity_modulated * cofactor_gate
+        
+        # ============================================================
         # Step 2: Call PARENT's predict_delta_multi_tf - EXACT v6 code
         # ============================================================
         # This calls IntegratedGRNModel.predict_delta_multi_tf with:
         # - Same GRN computation
         # - Same context gating (FiLM)
-        # - Same cofactor gate
         # - Same delta_basic + delta_neural blending
+        # NOTE: Parent also has cofactor gate, but we apply it here FIRST
+        # for exact per-TF modulation before GRN multiplication
         delta, grn_matrix = super().predict_delta_multi_tf(
             tf_activity_modulated, 
             source_expression
@@ -492,12 +503,14 @@ def main():
     train_dataset = MultiTFDataset(
         expression_means=expression,
         tf_activity=tf_activity,
-        celltype_pairs=train_pairs
+        celltype_names=list(celltypes),
+        allowed_pairs=train_pairs
     )
     val_dataset = MultiTFDataset(
         expression_means=expression,
         tf_activity=tf_activity,
-        celltype_pairs=val_pairs
+        celltype_names=list(celltypes),
+        allowed_pairs=val_pairs
     )
     
     train_loader = DataLoader(
