@@ -4,38 +4,23 @@
 BRIDGE 2.0: COMPLETE MOLECULAR SIGNALING NETWORK TRAINING
 ================================================================================
 
-Extension of train_v6 to incorporate:
+EXTENSION of train_v6.py - Uses EXACTLY the same IntegratedGRNModel architecture
+with ADDITIONAL dimensions for:
 - Gene→Gene signaling (OmniPath)
 - Gene→TF regulation (OmniPath) 
-- TF→Gene expression (ChIP-Atlas)
-- TF→TF cascade (ChIP-Atlas + OmniPath)
-- Cofactor modulation (Rosetta PPI)
 
-Key Innovation:
-- Phase 1: Learn known network from OmniPath + ChIP-Atlas
-- Phase 2: Discovery mode - explore unknown connections
+All components from train_v6 are PRESERVED:
+- IntegratedGRNModel with TFRegulatoryEncoder, SingleCellDataEncoder
+- Cell-type PAIR holdout validation
+- DELTA prediction focus
+- JASPAR/PPI integration
+- Multi-TF training mode
+- Cofactor gating
 
-Architecture:
-```
-                    OmniPath                     ChIP-Atlas
-                   Gene→Gene                      TF→Gene
-                   Gene→TF                        TF→TF
-                      ↓                              ↓
-              ┌──────────────────────────────────────────────┐
-              │         UNIFIED SIGNALING GRAPH GNN          │
-              │                                              │
-              │   Gene Nodes ←→ TF Nodes (message passing)   │
-              │                                              │
-              └──────────────────────────────────────────────┘
-                                    ↓
-              ┌──────────────────────────────────────────────┐
-              │         PERTURBATION PREDICTION              │
-              │                                              │
-              │   TF_activity_change → Gene_expression_Δ     │
-              │   + Gene_state_change → TF_activity_Δ        │
-              │                                              │
-              └──────────────────────────────────────────────┘
-```
+NEW ADDITIONS:
+- Gene→Gene propagation network (learned from OmniPath prior)
+- Gene→TF modulation (upstream regulation)
+- Two-phase training (known network → discovery)
 
 Usage:
     python scripts/train_v7.py \
@@ -51,117 +36,58 @@ Author: BRIDGE Team
 
 import os
 import sys
-import argparse
 import json
+import argparse
 import pickle
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler, RandomSampler
 from tqdm import tqdm
 from scipy import stats as scipy_stats
 import warnings
+warnings.filterwarnings('ignore')
 
-# DGL for graph neural networks
-try:
-    import dgl
-    from dgl.nn import GraphConv, GATConv
-    HAS_DGL = True
-except ImportError:
-    HAS_DGL = False
-    print("Warning: DGL not installed. Using simplified cascade.")
+# Add parent dir for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# ============================================================================
+# IMPORT EVERYTHING FROM train_v6 - KEEP EXACT SAME CODE
+# ============================================================================
+from scripts.train_v6 import (
+    # Data loading
+    load_singlecell_data,
+    load_tf_binding,
+    compute_tf_activity_linger,
+    compute_baseline_metrics,
+    
+    # Model
+    IntegratedGRNModel,
+    
+    # Dataset
+    MultiTFDataset,
+    
+    # Training
+    DeltaFocusedLoss,
+)
+
+# Import sophisticated model components
+from models.monster_grn import MonsterGRNModel, create_monster_grn
+from models.tf_encoder import TFRegulatoryEncoder, TFCascadeGCN
+from models.cell_encoder import CellStateEncoder, SingleCellDataEncoder
+from modules.perturbation import LINGERStyleGRN, PerturbationPredictor
 
 
 # =============================================================================
-# DATA LOADING
+# OMNIPATH LOADING
 # =============================================================================
 
-def load_singlecell_data(h5ad_path: str, celltype_key: str = 'celltype'):
-    """Load and preprocess single-cell data."""
-    import scanpy as sc
-    
-    print(f"Loading {h5ad_path}...")
-    adata = sc.read_h5ad(h5ad_path)
-    
-    # Check if already aggregated
-    if len(adata) < 500:
-        print(f"  Detected pre-aggregated pseudo-bulk data")
-        expression = adata.X
-        if hasattr(expression, 'toarray'):
-            expression = expression.toarray()
-        celltypes = adata.obs[celltype_key].values if celltype_key in adata.obs else adata.obs.index.values
-        gene_names = list(adata.var_names)
-    else:
-        print(f"  Aggregating to pseudo-bulk by {celltype_key}...")
-        celltypes = adata.obs[celltype_key].unique()
-        expression = np.zeros((len(celltypes), adata.n_vars))
-        for i, ct in enumerate(celltypes):
-            mask = adata.obs[celltype_key] == ct
-            ct_expr = adata.X[mask]
-            if hasattr(ct_expr, 'toarray'):
-                ct_expr = ct_expr.toarray()
-            expression[i] = ct_expr.mean(axis=0)
-        gene_names = list(adata.var_names)
-    
-    print(f"  {len(celltypes)} cell types")
-    print(f"  Expression: {expression.shape}")
-    
-    return expression.astype(np.float32), gene_names, list(celltypes)
-
-
-def load_tf_binding(tf_binding_dir: str, gene_names: List[str]):
-    """Load TF binding matrices from ChIP-Atlas data."""
-    tf_dir = Path(tf_binding_dir)
-    
-    # Load mappings
-    mappings_path = tf_dir / 'mappings.pkl'
-    if mappings_path.exists():
-        with open(mappings_path, 'rb') as f:
-            mappings = pickle.load(f)
-        tf_names = mappings.get('tf_names', [])
-        binding_gene_names = mappings.get('gene_names', [])
-    else:
-        tf_names = pd.read_csv(tf_dir.parent / 'tf_names.csv', header=None)[0].tolist()
-        binding_gene_names = gene_names
-    
-    # Load binding matrix
-    binding_path = tf_dir / 'binding_matrix.npy'
-    if binding_path.exists():
-        binding_matrix = np.load(binding_path)
-    else:
-        binding_matrix = np.zeros((len(gene_names), len(tf_names)))
-    
-    # Load TF-TF adjacency
-    tf_tf_path = tf_dir / 'tf_tf_adjacency.npy'
-    if tf_tf_path.exists():
-        tf_tf_adj = np.load(tf_tf_path)
-    else:
-        tf_tf_adj = np.zeros((len(tf_names), len(tf_names)))
-    
-    # Align genes
-    gene_to_idx = {g.upper(): i for i, g in enumerate(gene_names)}
-    binding_gene_to_idx = {g.upper(): i for i, g in enumerate(binding_gene_names)}
-    
-    aligned_binding = np.zeros((len(gene_names), len(tf_names)), dtype=np.float32)
-    for gene in gene_names:
-        gene_upper = gene.upper()
-        if gene_upper in gene_to_idx and gene_upper in binding_gene_to_idx:
-            aligned_binding[gene_to_idx[gene_upper]] = binding_matrix[binding_gene_to_idx[gene_upper]]
-    
-    print(f"  Aligned {np.sum(aligned_binding.any(axis=1))}/{len(gene_names)} genes")
-    print(f"  TFs: {len(tf_names)}")
-    print(f"  Binding: {aligned_binding.shape}")
-    
-    return aligned_binding, tf_names, tf_tf_adj
-
-
-def load_omnipath(omnipath_dir: str, n_genes: int, n_tfs: int):
+def load_omnipath(omnipath_dir: str, n_genes: int, n_tfs: int) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """Load OmniPath signaling matrices."""
     opath = Path(omnipath_dir)
     
@@ -194,292 +120,130 @@ def load_omnipath(omnipath_dir: str, n_genes: int, n_tfs: int):
     return gene_gene, gene_tf, tf_tf_omnipath
 
 
-def compute_tf_activity_linger(expression: np.ndarray, binding_matrix: np.ndarray) -> np.ndarray:
-    """Compute TF activity using LINGER-style method."""
-    binding_norm = binding_matrix / (binding_matrix.sum(axis=0, keepdims=True) + 1e-8)
-    tf_activity = expression @ binding_norm
-    return tf_activity.astype(np.float32)
-
-
 # =============================================================================
-# UNIFIED SIGNALING GRAPH MODEL
+# EXTENDED MODEL - SAME AS train_v6 IntegratedGRNModel + OmniPath
 # =============================================================================
 
-class UnifiedSignalingGNN(nn.Module):
+class IntegratedGRNModelV7(IntegratedGRNModel):
     """
-    Graph Neural Network that operates on the unified signaling graph.
+    Extended IntegratedGRNModel with OmniPath Gene→Gene and Gene→TF networks.
     
-    Nodes: All genes (including TFs)
-    Edges: 
-        - Gene→Gene (OmniPath activation/inhibition)
-        - Gene→TF (OmniPath TF regulation)
-        - TF→Gene (ChIP-Atlas binding)
-        - TF→TF (ChIP-Atlas + OmniPath cascade)
+    Inherits ALL functionality from IntegratedGRNModel (train_v6), adds:
+    - Gene→Gene propagation (signaling cascades)
+    - Gene→TF modulation (upstream regulation)
     """
     
-    def __init__(self, n_genes: int, n_tfs: int, hidden_dim: int = 256, n_layers: int = 3):
-        super().__init__()
-        
-        self.n_genes = n_genes
-        self.n_tfs = n_tfs
-        self.hidden_dim = hidden_dim
-        
-        # Node embeddings
-        self.gene_embed = nn.Embedding(n_genes, hidden_dim)
-        
-        # Edge type embeddings (for heterogeneous edges)
-        self.edge_type_embed = nn.Embedding(4, hidden_dim)  # 4 edge types
-        
-        # GNN layers
-        if HAS_DGL:
-            self.gnn_layers = nn.ModuleList([
-                GATConv(hidden_dim, hidden_dim // 4, num_heads=4, 
-                       feat_drop=0.1, attn_drop=0.1, residual=True)
-                for _ in range(n_layers)
-            ])
-        else:
-            # Fallback: simple message passing
-            self.gnn_layers = nn.ModuleList([
-                nn.Linear(hidden_dim, hidden_dim)
-                for _ in range(n_layers)
-            ])
-        
-        # Layer norms
-        self.layer_norms = nn.ModuleList([
-            nn.LayerNorm(hidden_dim) for _ in range(n_layers)
-        ])
-        
-        # Output projection
-        self.output_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1)
+    def __init__(
+        self,
+        n_genes: int,
+        n_tfs: int,
+        n_batches: int = 1,
+        hidden_dim: int = 512,
+        num_gcn_layers: int = 3,
+        num_transformer_layers: int = 2,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        use_context_gating: bool = True,
+        use_gene_propagation: bool = True,  # NEW
+        use_gene_tf_modulation: bool = True  # NEW
+    ):
+        # Initialize parent class (IntegratedGRNModel from train_v6)
+        super().__init__(
+            n_genes=n_genes,
+            n_tfs=n_tfs,
+            n_batches=n_batches,
+            hidden_dim=hidden_dim,
+            num_gcn_layers=num_gcn_layers,
+            num_transformer_layers=num_transformer_layers,
+            num_heads=num_heads,
+            dropout=dropout,
+            use_context_gating=use_context_gating
         )
         
-        # Graph storage
-        self.graph = None
-        self.edge_weights = None
+        self.use_gene_propagation = use_gene_propagation
+        self.use_gene_tf_modulation = use_gene_tf_modulation
         
-    def build_graph(self, gene_gene: np.ndarray, gene_tf: np.ndarray,
-                    tf_gene: np.ndarray, tf_tf: np.ndarray, tf_indices: np.ndarray):
+        # ============================================================
+        # NEW Component: Gene→Gene Propagation Network
+        # ============================================================
+        if use_gene_propagation:
+            # Learnable gene propagation weights (initialized from OmniPath)
+            self.gene_propagation = nn.Parameter(torch.zeros(n_genes, n_genes))
+            
+            # Prior from OmniPath (fixed, used for regularization)
+            self.register_buffer('gene_gene_prior', torch.zeros(n_genes, n_genes))
+            
+            # Propagation steps and weight
+            self.gene_prop_steps = 2
+            self.gene_prop_weight = nn.Parameter(torch.tensor(0.3))
+        
+        # ============================================================
+        # NEW Component: Gene→TF Modulation Network
+        # ============================================================
+        if use_gene_tf_modulation:
+            # Learnable gene→TF effects
+            self.gene_to_tf = nn.Parameter(torch.zeros(n_tfs, n_genes))
+            
+            # Prior from OmniPath
+            self.register_buffer('gene_tf_prior', torch.zeros(n_genes, n_tfs))
+            
+            # Modulation strength
+            self.gene_tf_modulation_strength = nn.Parameter(torch.tensor(0.2))
+        
+        # Update config
+        self.config['use_gene_propagation'] = use_gene_propagation
+        self.config['use_gene_tf_modulation'] = use_gene_tf_modulation
+        self.config['model_version'] = 'v7'
+    
+    def set_omnipath_priors(
+        self,
+        gene_gene: Optional[torch.Tensor] = None,
+        gene_tf: Optional[torch.Tensor] = None
+    ):
         """
-        Build unified graph from adjacency matrices.
-        
-        All matrices are in gene-space:
-        - gene_gene: (n_genes, n_genes)
-        - gene_tf: (n_genes, n_tfs) → map TF indices to gene indices
-        - tf_gene: (n_tfs, n_genes) → map TF indices to gene indices
-        - tf_tf: (n_tfs, n_tfs) → map TF indices to gene indices
+        Set OmniPath priors for gene networks.
         
         Args:
-            tf_indices: Indices of TFs in the gene list
+            gene_gene: (n_genes, n_genes) Gene→Gene signaling adjacency
+            gene_tf: (n_genes, n_tfs) Gene→TF regulation adjacency
         """
-        if not HAS_DGL:
-            return
+        device = self.direct_effects.device
         
-        edges_src = []
-        edges_dst = []
-        edge_weights = []
-        edge_types = []  # 0: gene→gene, 1: gene→tf, 2: tf→gene, 3: tf→tf
-        
-        # Gene→Gene edges
-        src, dst = np.nonzero(gene_gene)
-        for i in range(len(src)):
-            edges_src.append(src[i])
-            edges_dst.append(dst[i])
-            edge_weights.append(gene_gene[src[i], dst[i]])
-            edge_types.append(0)
-        
-        # Gene→TF edges (map TF to gene index)
-        src, dst = np.nonzero(gene_tf)
-        for i in range(len(src)):
-            gene_idx = src[i]
-            tf_idx = dst[i]
-            if tf_idx < len(tf_indices):
-                tf_gene_idx = tf_indices[tf_idx]
-                edges_src.append(gene_idx)
-                edges_dst.append(tf_gene_idx)
-                edge_weights.append(gene_tf[src[i], dst[i]])
-                edge_types.append(1)
-        
-        # TF→Gene edges
-        src, dst = np.nonzero(tf_gene)
-        for i in range(len(src)):
-            tf_idx = src[i]
-            gene_idx = dst[i]
-            if tf_idx < len(tf_indices):
-                tf_gene_idx = tf_indices[tf_idx]
-                edges_src.append(tf_gene_idx)
-                edges_dst.append(gene_idx)
-                edge_weights.append(tf_gene[src[i], dst[i]])
-                edge_types.append(2)
-        
-        # TF→TF edges
-        src, dst = np.nonzero(tf_tf)
-        for i in range(len(src)):
-            if src[i] < len(tf_indices) and dst[i] < len(tf_indices):
-                edges_src.append(tf_indices[src[i]])
-                edges_dst.append(tf_indices[dst[i]])
-                edge_weights.append(tf_tf[src[i], dst[i]])
-                edge_types.append(3)
-        
-        # Create DGL graph
-        self.graph = dgl.graph((edges_src, edges_dst), num_nodes=self.n_genes)
-        self.edge_weights = torch.FloatTensor(edge_weights)
-        self.edge_types = torch.LongTensor(edge_types)
-        
-        # Add self-loops
-        self.graph = dgl.add_self_loop(self.graph)
-        self.edge_weights = torch.cat([self.edge_weights, torch.ones(self.n_genes)])
-        self.edge_types = torch.cat([self.edge_types, torch.zeros(self.n_genes, dtype=torch.long)])
-        
-        print(f"  [UnifiedGNN] Built graph: {self.graph.number_of_nodes()} nodes, {self.graph.number_of_edges()} edges")
-    
-    def forward(self, gene_states: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Forward pass through the signaling graph.
-        
-        Args:
-            gene_states: Optional (batch, n_genes) expression states
+        if gene_gene is not None and self.use_gene_propagation:
+            self.gene_gene_prior.copy_(gene_gene.float().to(device))
             
-        Returns:
-            node_embeddings: (n_genes, hidden_dim) updated node representations
-        """
-        # Initial embeddings
-        x = self.gene_embed.weight  # (n_genes, hidden_dim)
-        
-        if self.graph is None or not HAS_DGL:
-            # Fallback: simple transformation
-            for layer, norm in zip(self.gnn_layers, self.layer_norms):
-                x = x + F.gelu(layer(x))
-                x = norm(x)
-            return x
-        
-        # Move graph to device
-        device = x.device
-        graph = self.graph.to(device)
-        edge_weights = self.edge_weights.to(device)
-        
-        # GNN message passing
-        for layer, norm in zip(self.gnn_layers, self.layer_norms):
-            # Apply GAT
-            h = layer(graph, x).flatten(1)  # GAT output
-            x = x + h
-            x = norm(x)
-        
-        return x
-
-
-class FullSignalingGRNModel(nn.Module):
-    """
-    Complete GRN model with full signaling network.
-    
-    Combines:
-    - TF→Gene effects (learned from ChIP-Atlas prior)
-    - Gene→Gene propagation (OmniPath signaling)
-    - Gene→TF regulation (OmniPath upstream)
-    - TF cascade (TF→TF)
-    """
-    
-    def __init__(self, n_genes: int, n_tfs: int, hidden_dim: int = 256,
-                 use_gnn: bool = True, n_gnn_layers: int = 3):
-        super().__init__()
-        
-        self.n_genes = n_genes
-        self.n_tfs = n_tfs
-        self.hidden_dim = hidden_dim
-        self.use_gnn = use_gnn and HAS_DGL
-        
-        # Learnable TF→Gene effects (main regulatory effects)
-        self.tf_to_gene = nn.Parameter(torch.zeros(n_genes, n_tfs))
-        nn.init.xavier_normal_(self.tf_to_gene)
-        
-        # Learnable Gene→TF effects (upstream regulation)
-        self.gene_to_tf = nn.Parameter(torch.zeros(n_tfs, n_genes))
-        nn.init.xavier_normal_(self.gene_to_tf)
-        
-        # Gene→Gene propagation weights
-        self.gene_propagation = nn.Parameter(torch.zeros(n_genes, n_genes))
-        
-        # TF importance (attention-like weighting)
-        self.tf_importance = nn.Parameter(torch.zeros(n_tfs))
-        
-        # ChIP mask and leakage
-        self.register_buffer('chip_mask', torch.ones(n_genes, n_tfs))
-        self._leakage_raw = nn.Parameter(torch.tensor(0.0))
-        
-        # Signaling network priors
-        self.register_buffer('gene_gene_prior', torch.zeros(n_genes, n_genes))
-        self.register_buffer('gene_tf_prior', torch.zeros(n_genes, n_tfs))
-        self.register_buffer('tf_tf_prior', torch.zeros(n_tfs, n_tfs))
-        
-        # Optional GNN for message passing
-        if self.use_gnn:
-            self.signaling_gnn = UnifiedSignalingGNN(n_genes, n_tfs, hidden_dim, n_gnn_layers)
-        
-        # Context encoder (cell state)
-        self.context_encoder = nn.Sequential(
-            nn.Linear(n_genes, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, n_tfs)
-        )
-        
-        # Discovery mode parameters
-        self.discovery_threshold = nn.Parameter(torch.tensor(0.0))
-        self.register_buffer('discovered_edges', torch.zeros(n_genes, n_genes))
-        
-    @property
-    def leakage(self):
-        return 0.005 + 0.195 * torch.sigmoid(self._leakage_raw)
-    
-    def set_priors(self, chip_mask: np.ndarray, gene_gene: np.ndarray,
-                   gene_tf: np.ndarray, tf_tf: np.ndarray,
-                   tf_specificity: Optional[np.ndarray] = None,
-                   tf_indices: Optional[np.ndarray] = None):
-        """Set network priors from preprocessed data."""
-        
-        self.chip_mask.copy_(torch.from_numpy(chip_mask).float())
-        self.gene_gene_prior.copy_(torch.from_numpy(gene_gene).float())
-        self.gene_tf_prior.copy_(torch.from_numpy(gene_tf).float())
-        self.tf_tf_prior.copy_(torch.from_numpy(tf_tf).float())
-        
-        # Initialize learnable parameters from priors
-        with torch.no_grad():
-            # Gene propagation starts from OmniPath prior
-            self.gene_propagation.copy_(torch.from_numpy(gene_gene).float() * 0.1)
+            # Initialize learnable weights from prior (scaled down)
+            with torch.no_grad():
+                self.gene_propagation.data = gene_gene.float().to(device) * 0.1
             
-            # Gene→TF starts from OmniPath prior
-            self.gene_to_tf.copy_(torch.from_numpy(gene_tf.T).float() * 0.1)
+            n_edges = (gene_gene != 0).sum().item()
+            print(f"  [Gene→Gene] {n_edges:,} edges from OmniPath")
         
-        # Build GNN graph
-        if self.use_gnn and tf_indices is not None:
-            tf_gene = self.chip_mask.cpu().numpy().T  # (n_tfs, n_genes)
-            self.signaling_gnn.build_graph(
-                gene_gene, gene_tf, tf_gene, tf_tf, tf_indices
-            )
+        if gene_tf is not None and self.use_gene_tf_modulation:
+            self.gene_tf_prior.copy_(gene_tf.float().to(device))
+            
+            # Initialize learnable weights from prior (transposed for proper dims)
+            with torch.no_grad():
+                self.gene_to_tf.data = gene_tf.T.float().to(device) * 0.1
+            
+            n_edges = (gene_tf != 0).sum().item()
+            print(f"  [Gene→TF] {n_edges:,} edges from OmniPath")
     
-    def get_effective_tf_effects(self) -> torch.Tensor:
-        """Get TF→Gene effects with ChIP mask and leakage."""
-        leakage = self.leakage
-        masked_effects = self.tf_to_gene * (self.chip_mask + leakage)
-        return masked_effects
-    
-    def compute_gene_propagation(self, gene_deltas: torch.Tensor, n_steps: int = 2) -> torch.Tensor:
+    def compute_gene_propagation(self, gene_deltas: torch.Tensor) -> torch.Tensor:
         """
         Propagate gene expression changes through the gene network.
         
-        This models signaling cascades: Gene A → Gene B → Gene C
+        Models signaling cascades: Gene A → Gene B → Gene C
         
         Args:
             gene_deltas: (batch, n_genes) initial gene changes (from TF effects)
-            n_steps: Number of propagation steps
             
         Returns:
             propagated_deltas: (batch, n_genes) after propagation
         """
+        if not self.use_gene_propagation:
+            return gene_deltas
+        
         # Combine learned and prior gene-gene effects
         gene_network = self.gene_propagation + 0.5 * self.gene_gene_prior
         
@@ -487,20 +251,22 @@ class FullSignalingGRNModel(nn.Module):
         row_norm = gene_network.abs().sum(dim=1, keepdim=True).clamp(min=1.0)
         gene_network_norm = gene_network / row_norm
         
-        # Iterative propagation
+        # Get propagation weight (bounded)
+        prop_weight = torch.sigmoid(self.gene_prop_weight) * 0.5  # max 0.5
+        
+        # Iterative propagation with residual
         current = gene_deltas
-        for _ in range(n_steps):
-            # Message passing: each gene receives signals from connected genes
-            propagated = current @ gene_network_norm.T
-            current = current + 0.3 * propagated  # Residual connection
+        for _ in range(self.gene_prop_steps):
+            propagated = torch.mm(current, gene_network_norm.T)
+            current = current + prop_weight * propagated
         
         return current
     
-    def compute_tf_modulation(self, gene_states: torch.Tensor) -> torch.Tensor:
+    def compute_gene_tf_modulation(self, gene_states: torch.Tensor) -> torch.Tensor:
         """
         Compute how gene states modulate TF activity.
         
-        This models upstream regulation: Gene → TF
+        Models upstream regulation: Gene → TF
         
         Args:
             gene_states: (batch, n_genes) current gene expression
@@ -508,199 +274,206 @@ class FullSignalingGRNModel(nn.Module):
         Returns:
             tf_modulation: (batch, n_tfs) multiplicative modulation of TF effects
         """
+        if not self.use_gene_tf_modulation:
+            return torch.ones(gene_states.size(0), self.n_tfs, device=gene_states.device)
+        
         # Combine learned and prior gene→TF effects
         gene_tf = self.gene_to_tf + 0.5 * self.gene_tf_prior.T
         
-        # Compute modulation
-        raw_modulation = gene_states @ gene_tf.T  # (batch, n_tfs)
+        # Compute raw modulation
+        raw_modulation = torch.mm(gene_states, gene_tf.T)  # (batch, n_tfs)
+        
+        # Get modulation strength (bounded)
+        mod_strength = torch.sigmoid(self.gene_tf_modulation_strength) * 0.4  # max 0.4
         
         # Convert to multiplicative gate (centered at 1.0)
-        tf_modulation = 1.0 + 0.2 * torch.tanh(raw_modulation / 10.0)
+        tf_modulation = 1.0 + mod_strength * torch.tanh(raw_modulation / 10.0)
         
         return tf_modulation
     
-    def forward(self, tf_activity_change: torch.Tensor, 
-                source_expression: torch.Tensor) -> torch.Tensor:
+    def predict_delta_multi_tf(
+        self,
+        tf_activity_change: torch.Tensor,
+        source_expression: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Predict gene expression changes from TF activity changes.
+        Predict expression CHANGE with full signaling network.
         
-        Full pipeline:
-        1. TF cascade effects (TF→TF)
-        2. Context modulation (cell state)
-        3. Gene→TF modulation (upstream regulation)
-        4. TF→Gene effects
-        5. Gene→Gene propagation
+        EXTENDS parent method with:
+        1. Gene→TF modulation (upstream regulation)
+        2. Gene→Gene propagation (signaling cascades)
         
         Args:
-            tf_activity_change: (batch, n_tfs) change in TF activity
-            source_expression: (batch, n_genes) source cell expression
+            tf_activity_change: (batch, n_tfs) - change in activity for ALL TFs
+            source_expression: (batch, n_genes) - source cell expression
             
         Returns:
-            predicted_delta: (batch, n_genes) predicted expression changes
+            predicted_delta: (batch, n_genes)
+            grn_matrix: (n_genes, n_tfs)
         """
-        batch_size = tf_activity_change.shape[0]
+        batch_size = tf_activity_change.size(0)
         device = tf_activity_change.device
         
-        # 1. TF cascade (TF→TF propagation)
-        tf_cascade = tf_activity_change @ (self.tf_tf_prior + 0.1 * torch.eye(self.n_tfs, device=device))
-        tf_effective = tf_activity_change + 0.3 * tf_cascade
+        # ============================================================
+        # Step 1: Gene→TF Modulation (NEW in v7)
+        # ============================================================
+        if source_expression is not None:
+            tf_modulation = self.compute_gene_tf_modulation(source_expression)
+            tf_activity_modulated = tf_activity_change * tf_modulation
+        else:
+            tf_activity_modulated = tf_activity_change
         
-        # 2. Context modulation (cell-type specific)
-        context = self.context_encoder(source_expression)  # (batch, n_tfs)
-        context_gate = torch.sigmoid(context)
-        tf_effective = tf_effective * context_gate
+        # ============================================================
+        # Step 2: Standard v6 delta prediction (TF→Gene)
+        # ============================================================
+        # Get GRN matrix
+        grn_matrix = self.get_grn_matrix()  # (n_genes, n_tfs)
         
-        # 3. Gene→TF modulation (upstream regulation)
-        tf_modulation = self.compute_tf_modulation(source_expression)
-        tf_effective = tf_effective * tf_modulation
+        # Basic delta = TF_change @ GRN
+        delta_basic = torch.mm(tf_activity_modulated, grn_matrix.T)  # (batch, n_genes)
         
-        # 4. TF→Gene effects
-        tf_effects = self.get_effective_tf_effects()  # (n_genes, n_tfs)
+        # Context gating (from v6)
+        if self.use_context_gating and source_expression is not None:
+            # Encode cell state
+            cell_outputs = self.cell_encoder(source_expression)
+            cell_emb = cell_outputs['cell_embedding']
+            
+            # Combine TF change with cell embedding
+            combined = torch.cat([tf_activity_modulated, cell_emb], dim=-1)
+            delta_neural = self.delta_decoder(combined)
+            
+            # FiLM modulation
+            context = self.context_encoder(source_expression)
+            gamma = self.context_gate(context)
+            beta = self.context_shift(context) * 0.1
+            
+            # Blend basic and neural
+            delta_gated = gamma * delta_basic + beta
+            delta_combined = 0.7 * delta_gated + 0.3 * delta_neural
+        else:
+            delta_combined = delta_basic
         
-        # Apply TF importance weighting
-        tf_importance = F.softmax(self.tf_importance, dim=0)
-        weighted_tf = tf_effective * tf_importance
+        # ============================================================
+        # Step 3: Gene→Gene Propagation (NEW in v7)
+        # ============================================================
+        delta_propagated = self.compute_gene_propagation(delta_combined)
         
-        # Compute initial gene deltas
-        gene_deltas = weighted_tf @ tf_effects.T  # (batch, n_genes)
+        # Cofactor gating (from v6)
+        if hasattr(self, 'cof_to_tf_adj') and self.cof_to_tf_adj is not None and source_expression is not None:
+            cofactor_expr = source_expression[:, self.cofactor_gene_indices.long()]
+            cofactor_influence = torch.mm(cofactor_expr, self.cof_to_tf_adj)
+            cofactor_gate = 1.0 + 0.2 * torch.tanh(cofactor_influence / 5.0)
+            
+            # Apply cofactor modulation
+            delta_propagated = delta_propagated * cofactor_gate.mean(dim=1, keepdim=True)
         
-        # 5. Gene→Gene propagation
-        propagated_deltas = self.compute_gene_propagation(gene_deltas)
-        
-        return propagated_deltas
+        return delta_propagated, grn_matrix
     
-    def get_grn_matrix(self) -> torch.Tensor:
-        """Get the learned GRN matrix (TF→Gene effects)."""
-        return self.get_effective_tf_effects()
-    
-    def get_signaling_network(self) -> Dict[str, torch.Tensor]:
-        """Get all learned signaling networks."""
-        return {
-            'tf_to_gene': self.get_effective_tf_effects().detach(),
-            'gene_to_gene': (self.gene_propagation + 0.5 * self.gene_gene_prior).detach(),
-            'gene_to_tf': (self.gene_to_tf + 0.5 * self.gene_tf_prior.T).detach(),
-            'tf_to_tf': self.tf_tf_prior.detach(),
+    def get_signaling_networks(self) -> Dict[str, torch.Tensor]:
+        """Get all learned signaling networks for analysis."""
+        networks = {
+            'tf_to_gene': self.get_grn_matrix().detach(),
         }
-
-
-# =============================================================================
-# DATASET
-# =============================================================================
-
-class SignalingPerturbationDataset(Dataset):
-    """
-    Dataset for full signaling network training.
-    
-    Each sample: (source_celltype, target_celltype) pair
-    - TF activity change between cell types
-    - Gene expression change (ground truth)
-    - Gene states for upstream modulation
-    """
-    
-    def __init__(self, expression: np.ndarray, tf_activity: np.ndarray,
-                 celltype_pairs: List[Tuple[int, int]]):
-        self.expression = torch.FloatTensor(expression)
-        self.tf_activity = torch.FloatTensor(tf_activity)
-        self.pairs = celltype_pairs
         
-    def __len__(self):
-        return len(self.pairs)
-    
-    def __getitem__(self, idx):
-        src_idx, tgt_idx = self.pairs[idx]
+        if self.use_gene_propagation:
+            networks['gene_to_gene'] = (self.gene_propagation + 0.5 * self.gene_gene_prior).detach()
         
-        return {
-            'tf_activity_change': self.tf_activity[tgt_idx] - self.tf_activity[src_idx],
-            'source_expression': self.expression[src_idx],
-            'target_expression': self.expression[tgt_idx],
-            'gene_delta': self.expression[tgt_idx] - self.expression[src_idx],
-        }
+        if self.use_gene_tf_modulation:
+            networks['gene_to_tf'] = (self.gene_to_tf + 0.5 * self.gene_tf_prior.T).detach()
+        
+        networks['tf_to_tf'] = self.tf_tf_adjacency.detach()
+        
+        return networks
 
 
 # =============================================================================
-# TRAINING
+# TRAINER - EXTENDS train_v6 trainer logic
 # =============================================================================
 
 class SignalingGRNTrainer:
-    """Trainer for full signaling GRN model."""
+    """Trainer for v7 model - same as v6 with additional metrics."""
     
-    def __init__(self, model: FullSignalingGRNModel, device: torch.device,
-                 lr: float = 1e-3, weight_decay: float = 0.01):
+    def __init__(
+        self,
+        model: IntegratedGRNModelV7,
+        device: torch.device,
+        lr: float = 1e-3,
+        weight_decay: float = 0.01,
+        use_amp: bool = True
+    ):
         self.model = model.to(device)
         self.device = device
+        self.use_amp = use_amp and device.type == 'cuda'
         
+        # Optimizer
         self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer, T_0=10, T_mult=2
         )
         
-        self.scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+        # AMP scaler
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
         
-    def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
+        # Loss function (from v6)
+        self.criterion = DeltaFocusedLoss(
+            delta_weight=1.0,
+            direction_weight=0.3,
+            sparsity_weight=0.001,
+            use_chip_reg=True
+        )
+        
+    def train_epoch(self, train_loader: DataLoader, epoch: int) -> Dict[str, float]:
         """Train one epoch."""
         self.model.train()
         
-        epoch_loss = 0
-        epoch_delta_corr = 0
+        epoch_metrics = {
+            'loss': 0.0,
+            'delta_corr': 0.0,
+            'dir_acc': 0.0
+        }
         n_batches = 0
         
-        pbar = tqdm(train_loader, desc="Training")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch:3d}")
+        
         for batch in pbar:
             tf_change = batch['tf_activity_change'].to(self.device)
             source_expr = batch['source_expression'].to(self.device)
-            gene_delta = batch['gene_delta'].to(self.device)
+            target_delta = batch['target_delta'].to(self.device)
             
             self.optimizer.zero_grad()
             
-            with torch.amp.autocast('cuda', enabled=self.scaler is not None):
-                pred_delta = self.model(tf_change, source_expr)
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                pred_delta, grn = self.model.predict_delta_multi_tf(tf_change, source_expr)
                 
-                # MSE loss on gene deltas
-                mse_loss = F.mse_loss(pred_delta, gene_delta)
-                
-                # Correlation loss (maximize correlation)
-                pred_flat = pred_delta.flatten()
-                actual_flat = gene_delta.flatten()
-                if pred_flat.std() > 1e-6 and actual_flat.std() > 1e-6:
-                    corr = torch.corrcoef(torch.stack([pred_flat, actual_flat]))[0, 1]
-                    corr_loss = 1 - corr
-                else:
-                    corr_loss = torch.tensor(0.0, device=self.device)
-                
-                # L1 regularization on network sparsity
-                l1_reg = 0.001 * (
-                    self.model.gene_propagation.abs().mean() +
-                    self.model.gene_to_tf.abs().mean()
+                loss, loss_dict = self.criterion(
+                    pred_delta, target_delta, grn, self.model.chip_mask
                 )
-                
-                loss = mse_loss + 0.5 * corr_loss + l1_reg
             
             if self.scaler:
                 self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
             
-            epoch_loss += loss.item()
-            
-            # Track delta correlation
-            with torch.no_grad():
-                if pred_flat.std() > 1e-6 and actual_flat.std() > 1e-6:
-                    epoch_delta_corr += torch.corrcoef(
-                        torch.stack([pred_flat, actual_flat])
-                    )[0, 1].item()
-            
+            epoch_metrics['loss'] += loss.item()
+            epoch_metrics['delta_corr'] += loss_dict.get('delta_pcc', 0.0)
+            epoch_metrics['dir_acc'] += loss_dict.get('dir_acc', 0.0)
             n_batches += 1
+            
             pbar.set_postfix(loss=f"{loss.item():.4f}")
         
         self.scheduler.step()
         
-        return {
-            'loss': epoch_loss / n_batches,
-            'delta_corr': epoch_delta_corr / n_batches,
-        }
+        # Average metrics
+        for k in epoch_metrics:
+            epoch_metrics[k] /= max(n_batches, 1)
+        
+        return epoch_metrics
     
     @torch.no_grad()
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
@@ -713,12 +486,15 @@ class SignalingGRNTrainer:
         for batch in val_loader:
             tf_change = batch['tf_activity_change'].to(self.device)
             source_expr = batch['source_expression'].to(self.device)
-            gene_delta = batch['gene_delta'].to(self.device)
+            target_delta = batch['target_delta'].to(self.device)
             
-            pred_delta = self.model(tf_change, source_expr)
+            pred_delta, _ = self.model.predict_delta_multi_tf(tf_change, source_expr)
             
             all_pred.append(pred_delta.cpu())
-            all_actual.append(gene_delta.cpu())
+            all_actual.append(target_delta.cpu())
+        
+        if len(all_pred) == 0:
+            return {'delta_pcc': 0.0, 'dir_acc': 0.0}
         
         all_pred = torch.cat(all_pred).numpy()
         all_actual = torch.cat(all_actual).numpy()
@@ -727,43 +503,51 @@ class SignalingGRNTrainer:
         pred_flat = all_pred.flatten()
         actual_flat = all_actual.flatten()
         
-        delta_pcc, _ = scipy_stats.pearsonr(pred_flat, actual_flat)
+        if np.std(pred_flat) > 1e-6 and np.std(actual_flat) > 1e-6:
+            delta_pcc, _ = scipy_stats.pearsonr(pred_flat, actual_flat)
+        else:
+            delta_pcc = 0.0
         
         # Direction accuracy
         pred_sign = np.sign(pred_flat)
         actual_sign = np.sign(actual_flat)
         significant = np.abs(actual_flat) > np.std(actual_flat) * 0.1
-        dir_acc = np.mean(pred_sign[significant] == actual_sign[significant])
+        if np.sum(significant) > 0:
+            dir_acc = np.mean(pred_sign[significant] == actual_sign[significant])
+        else:
+            dir_acc = 0.5
         
         return {
-            'delta_pcc': delta_pcc,
-            'dir_acc': dir_acc,
+            'delta_pcc': float(delta_pcc),
+            'dir_acc': float(dir_acc),
         }
 
 
 # =============================================================================
-# MAIN
+# MAIN - Same flow as train_v6 with OmniPath added
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='BRIDGE 2.0: Full Signaling Network Training')
+    parser = argparse.ArgumentParser(description='BRIDGE 2.0: Full Signaling Network (extends train_v6)')
     parser.add_argument('--singlecell', type=str, required=True, help='Path to h5ad file')
     parser.add_argument('--tf-binding', type=str, required=True, help='TF binding directory')
-    parser.add_argument('--omnipath', type=str, default=None, help='OmniPath directory')
+    parser.add_argument('--omnipath', type=str, default=None, help='OmniPath directory (optional)')
     parser.add_argument('--ppi', type=str, default=None, help='PPI directory')
     parser.add_argument('--output', type=str, required=True, help='Output directory')
     parser.add_argument('--celltype-key', type=str, default='sclc_subcluster')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--hidden-dim', type=int, default=256)
+    parser.add_argument('--hidden-dim', type=int, default=512)
     parser.add_argument('--val-every', type=int, default=5)
-    parser.add_argument('--use-gnn', action='store_true', help='Use GNN for message passing')
+    parser.add_argument('--no-gene-propagation', action='store_true', help='Disable gene→gene propagation')
+    parser.add_argument('--no-gene-tf-modulation', action='store_true', help='Disable gene→TF modulation')
     
     args = parser.parse_args()
     
     print("=" * 70)
     print("BRIDGE 2.0: FULL MOLECULAR SIGNALING NETWORK")
+    print("(Extends train_v6 architecture with OmniPath integration)")
     print("=" * 70)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -772,31 +556,48 @@ def main():
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load data
-    print("\n[1/5] Loading single-cell data...")
+    # =========================================================================
+    # Load data (SAME AS train_v6)
+    # =========================================================================
+    print("\n[1/6] Loading single-cell data...")
     expression, gene_names, celltypes = load_singlecell_data(args.singlecell, args.celltype_key)
     
-    print("\n[2/5] Loading TF binding data...")
+    print("\n[2/6] Loading TF binding data...")
     binding_matrix, tf_names, tf_tf_adj = load_tf_binding(args.tf_binding, gene_names)
     
-    print("\n[3/5] Loading OmniPath signaling network...")
+    print("\n[3/6] Computing TF activity...")
+    tf_activity = compute_tf_activity_linger(expression, binding_matrix)
+    print(f"  TF activity: {tf_activity.shape}")
+    
+    print("\n[4/6] Computing baselines...")
+    baselines = compute_baseline_metrics(expression)
+    print(f"  Source-Target PCC: {baselines['source_target_pcc']:.4f}")
+    print(f"  Mean-Pred PCC: {baselines['mean_pred_pcc']:.4f}")
+    
+    # =========================================================================
+    # Load OmniPath (NEW in v7)
+    # =========================================================================
+    print("\n[5/6] Loading OmniPath signaling network...")
     if args.omnipath:
         gene_gene, gene_tf, tf_tf_omnipath = load_omnipath(
             args.omnipath, len(gene_names), len(tf_names)
         )
         # Blend TF-TF from ChIP and OmniPath
-        tf_tf_combined = tf_tf_adj + 0.5 * (tf_tf_omnipath if tf_tf_omnipath is not None else 0)
+        if tf_tf_omnipath is not None:
+            tf_tf_combined = tf_tf_adj + 0.3 * tf_tf_omnipath
+        else:
+            tf_tf_combined = tf_tf_adj
+        has_omnipath = True
     else:
         gene_gene = np.zeros((len(gene_names), len(gene_names)), dtype=np.float32)
         gene_tf = np.zeros((len(gene_names), len(tf_names)), dtype=np.float32)
         tf_tf_combined = tf_tf_adj
-        print("  No OmniPath data, using zeros")
+        has_omnipath = False
+        print("  No OmniPath data provided, using v6 architecture")
     
-    print("\n[4/5] Computing TF activity...")
-    tf_activity = compute_tf_activity_linger(expression, binding_matrix)
-    print(f"  TF activity: {tf_activity.shape}")
-    
-    # Create cell-type pairs
+    # =========================================================================
+    # Create cell-type pairs (SAME AS train_v6)
+    # =========================================================================
     n_celltypes = len(celltypes)
     n_holdout = max(2, n_celltypes // 6)
     np.random.seed(42)
@@ -806,50 +607,91 @@ def main():
     train_pairs = [(i, j) for i in train_idx for j in train_idx if i != j]
     val_pairs = [(i, j) for i in holdout for j in holdout if i != j]
     
-    print(f"\n  Train pairs: {len(train_pairs)}")
-    print(f"  Val pairs: {len(val_pairs)}")
+    print(f"\n  Train cell-type pairs: {len(train_pairs)}")
+    print(f"  Val cell-type pairs: {len(val_pairs)}")
     
-    # Create datasets
-    train_dataset = SignalingPerturbationDataset(expression, tf_activity, train_pairs)
-    val_dataset = SignalingPerturbationDataset(expression, tf_activity, val_pairs)
+    # =========================================================================
+    # Create datasets (SAME AS train_v6)
+    # =========================================================================
+    train_dataset = MultiTFDataset(
+        expression_means=expression,
+        tf_activity=tf_activity,
+        celltype_pairs=train_pairs
+    )
+    val_dataset = MultiTFDataset(
+        expression_means=expression,
+        tf_activity=tf_activity,
+        celltype_pairs=val_pairs
+    )
     
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        drop_last=len(train_dataset) > args.batch_size
+    )
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     
-    # Find TF indices in gene list
-    gene_upper = {g.upper(): i for i, g in enumerate(gene_names)}
-    tf_indices = np.array([gene_upper.get(t.upper(), -1) for t in tf_names])
-    valid_tf_mask = tf_indices >= 0
-    tf_indices = tf_indices[valid_tf_mask]
+    # =========================================================================
+    # Create model (EXTENDED from train_v6)
+    # =========================================================================
+    print("\n[6/6] Building model...")
     
-    print("\n[5/5] Building model...")
-    model = FullSignalingGRNModel(
+    model = IntegratedGRNModelV7(
         n_genes=len(gene_names),
         n_tfs=len(tf_names),
         hidden_dim=args.hidden_dim,
-        use_gnn=args.use_gnn
+        use_gene_propagation=has_omnipath and not args.no_gene_propagation,
+        use_gene_tf_modulation=has_omnipath and not args.no_gene_tf_modulation
     )
     
-    # Set network priors
+    # Set priors (from train_v6)
     model.set_priors(
-        chip_mask=binding_matrix,
-        gene_gene=gene_gene,
-        gene_tf=gene_tf,
-        tf_tf=tf_tf_combined,
-        tf_indices=tf_indices
+        chip_binding=torch.from_numpy(binding_matrix),
+        tf_tf_adjacency=torch.from_numpy(tf_tf_combined),
     )
+    
+    # Load PPI (from train_v6)
+    if args.ppi:
+        ppi_dir = Path(args.ppi)
+        if (ppi_dir / 'cof_to_tf_adj.npy').exists():
+            cof_to_tf = np.load(ppi_dir / 'cof_to_tf_adj.npy')
+            cof_indices = np.load(ppi_dir / 'cofactor_gene_indices.npy')
+            model.set_priors(
+                chip_binding=torch.from_numpy(binding_matrix),
+                tf_tf_adjacency=torch.from_numpy(tf_tf_combined),
+                cofactor_tf_adjacency=torch.from_numpy(cof_to_tf),
+                cofactor_gene_indices=torch.from_numpy(cof_indices)
+            )
+    
+    # Set OmniPath priors (NEW in v7)
+    if has_omnipath:
+        model.set_omnipath_priors(
+            gene_gene=torch.from_numpy(gene_gene),
+            gene_tf=torch.from_numpy(gene_tf)
+        )
+    
+    model = model.to(device)
     
     print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"  Gene propagation: {'ON' if model.use_gene_propagation else 'OFF'}")
+    print(f"  Gene→TF modulation: {'ON' if model.use_gene_tf_modulation else 'OFF'}")
     
     # Save metadata
     pd.DataFrame({'gene': gene_names}).to_csv(output_dir / 'gene_names.csv', index=False, header=False)
     pd.DataFrame({'tf': tf_names}).to_csv(output_dir / 'tf_names.csv', index=False, header=False)
     pd.DataFrame({'celltype': celltypes}).to_csv(output_dir / 'celltype_names.csv', index=False, header=False)
+    np.save(output_dir / 'tf_activity.npy', tf_activity)
+    np.save(output_dir / 'binding_matrix.npy', binding_matrix)
     
-    # Train
+    with open(output_dir / 'baselines.json', 'w') as f:
+        json.dump(baselines, f, indent=2)
+    
+    # =========================================================================
+    # Train (SAME LOGIC AS train_v6)
+    # =========================================================================
     print("\n" + "=" * 70)
     print("TRAINING")
     print("=" * 70)
+    print(f"  Baselines to beat: Source-Target PCC={baselines['source_target_pcc']:.4f}")
     
     trainer = SignalingGRNTrainer(model, device, lr=args.lr)
     
@@ -857,11 +699,12 @@ def main():
     best_epoch = 0
     
     for epoch in range(1, args.epochs + 1):
-        train_metrics = trainer.train_epoch(train_loader)
+        train_metrics = trainer.train_epoch(train_loader, epoch)
         
-        print(f"Epoch {epoch:3d}: loss={train_metrics['loss']:.4f} delta_corr={train_metrics['delta_corr']:.4f}")
+        print(f"Epoch {epoch:3d}: loss={train_metrics['loss']:.4f} "
+              f"delta={train_metrics['delta_corr']:.3f} dir={train_metrics['dir_acc']:.3f}")
         
-        if epoch % args.val_every == 0:
+        if epoch % args.val_every == 0 or epoch == 1:
             val_metrics = trainer.validate(val_loader)
             print(f"  [VAL] Delta_PCC={val_metrics['delta_pcc']:.4f} Dir_Acc={val_metrics['dir_acc']:.4f}")
             
@@ -873,11 +716,17 @@ def main():
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
+                    'config': model.config,
                     'delta_pcc': best_delta_pcc,
                 }, output_dir / 'best_model.pt')
                 
-                # Save signaling networks
-                networks = model.get_signaling_network()
+                # Save GRN matrix
+                grn = model.get_grn_matrix().detach().cpu().numpy()
+                np.save(output_dir / 'grn_matrix.npy', grn)
+                np.save(output_dir / 'grn_matrix_CORRECT.npy', grn)
+                
+                # Save all signaling networks
+                networks = model.get_signaling_networks()
                 for name, tensor in networks.items():
                     np.save(output_dir / f'{name}.npy', tensor.cpu().numpy())
                 
@@ -888,8 +737,11 @@ def main():
     print("=" * 70)
     print(f"Best model: Epoch {best_epoch}, Delta_PCC={best_delta_pcc:.4f}")
     print(f"Saved to: {output_dir}")
+    
+    # Save final config
+    with open(output_dir / 'model_config.json', 'w') as f:
+        json.dump(model.config, f, indent=2)
 
 
 if __name__ == '__main__':
     main()
-
