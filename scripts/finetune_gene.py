@@ -244,7 +244,12 @@ class GeneSpecificTrainer(SignalingGRNTrainer):
                     tf_change, source_expr
                 )
                 
-                losses = self.loss_fn(pred_delta, actual_delta)
+                # Pass grn_matrix and chip_mask for ChIP regularization
+                losses = self.loss_fn(
+                    pred_delta, actual_delta,
+                    grn_matrix,
+                    getattr(self.model, 'chip_mask', None)
+                )
                 
                 # Add L2 prior penalty (inherited from SignalingGRNTrainer)
                 prior_penalty = self.compute_prior_penalty()
@@ -332,10 +337,15 @@ class GeneSpecificTrainer(SignalingGRNTrainer):
                 
                 from torch.cuda.amp import autocast
                 with autocast(enabled=self.use_amp):
-                    pred_delta, _ = self.model.predict_delta_multi_tf(
+                    pred_delta, grn_matrix = self.model.predict_delta_multi_tf(
                         tf_change, source_expr
                     )
-                    losses = self.loss_fn(pred_delta, actual_delta)
+                    # Pass grn_matrix and chip_mask for ChIP regularization
+                    losses = self.loss_fn(
+                        pred_delta, actual_delta,
+                        grn_matrix,
+                        getattr(self.model, 'chip_mask', None)
+                    )
                 
                 total_loss += losses['total'].item()
                 all_pred_deltas.append(pred_delta.cpu())
@@ -515,8 +525,9 @@ def run_neighborhood_analysis(
         
         # Add edges: Gene→TF (weighted by path contribution)
         if path_scores is not None:
-            # Threshold: keep only top edges
-            threshold = np.percentile(np.abs(path_scores[path_scores != 0]), 95)
+            # Threshold: keep only top edges (with safe fallback for sparse/zero matrices)
+            nonzero_scores = np.abs(path_scores[path_scores != 0])
+            threshold = np.percentile(nonzero_scores, 95) if nonzero_scores.size > 0 else 0.0
             
             for gi in top_gene_idx[:top_k]:
                 g_name = gene_names[gi]
@@ -888,6 +899,11 @@ def main():
     # Replace optimizer with one that only updates finetune_params
     trainer.optimizer = torch.optim.AdamW(finetune_params, lr=args.lr, weight_decay=0.01)
     
+    # LR scheduler: reduce on plateau to lock in gains and prevent jitter
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        trainer.optimizer, mode='max', factor=0.5, patience=3, verbose=True
+    )
+    
     print(f"  Gene propagation: {'ON' if model.use_gene_propagation else 'OFF'}")
     print(f"  Gene→TF modulation: {'ON' if model.use_gene_tf_modulation else 'OFF'}")
     
@@ -935,6 +951,9 @@ def main():
                 
                 print(f"  >> New best! {target_gene}_PCC={best_target_pcc:.4f}")
             
+            # Step LR scheduler (mode='max' so we pass val_target_pcc directly)
+            scheduler.step(val_metrics['val_target_pcc'])
+
             # Record history
             history.append({
                 'epoch': epoch,

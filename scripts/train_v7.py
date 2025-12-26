@@ -575,7 +575,12 @@ class SignalingGRNTrainer(IntegratedGRNTrainer):
                     tf_change, source_expr
                 )
                 
-                losses = self.loss_fn(pred_delta, actual_delta)
+                # Pass grn_matrix and chip_mask for ChIP regularization
+                losses = self.loss_fn(
+                    pred_delta, actual_delta, 
+                    grn_matrix, 
+                    getattr(self.model, 'chip_mask', None)
+                )
                 
                 # Add L2 prior penalty (NEW in v7)
                 prior_penalty = self.compute_prior_penalty()
