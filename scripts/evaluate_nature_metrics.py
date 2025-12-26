@@ -8,10 +8,10 @@ Complete evaluation for publication-quality reporting:
 
 CORE METRICS:
 1. Per-gene ΔPCC distribution (median, IQR, fraction >0.3/0.5/0.7)
-2. AUPRC/AUROC for up vs down regulation
+2. AUPRC/AUROC for up vs down regulation (multiple thresholds)
 3. Ablations with 95% bootstrap CI
 4. Held-out TF test
-5. Delta baselines (ridge, ChIP-only, no-change)
+5. Delta baselines (ridge, ChIP-only, OmniPath-only, ChIP+OmniPath, no-change)
 
 ADVANCED METRICS:
 6. Per-cell-type performance heatmap
@@ -19,9 +19,10 @@ ADVANCED METRICS:
 8. Risk-coverage curves (selective prediction)
 9. Spearman/Rank quality and NDCG
 10. Error stratification by biology (expression variance, ChIP density)
-11. Prior consistency and edge overlap with OmniPath/ChIP
+11. Prior consistency and edge overlap PR curves
 12. Robustness to noise and shuffle controls
-13. R² on deltas
+13. R² on deltas (global and masked)
+14. Residual diagnostics (scatter and QQ-plot)
 
 Usage:
     python scripts/evaluate_nature_metrics.py \
@@ -56,6 +57,9 @@ import seaborn as sns
 import warnings
 warnings.filterwarnings('ignore')
 
+# Global seed for reproducibility
+RANDOM_SEED = 42
+
 # Add parent dir for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -74,8 +78,10 @@ from torch.utils.data import DataLoader
 # UTILITY FUNCTIONS
 # =============================================================================
 
-def bootstrap_ci(values: np.ndarray, n_bootstrap: int = 1000, ci: float = 0.95) -> Tuple[float, float, float]:
-    """Compute bootstrap confidence interval."""
+def bootstrap_ci(values: np.ndarray, n_bootstrap: int = 1000, ci: float = 0.95,
+                 seed: int = RANDOM_SEED) -> Tuple[float, float, float]:
+    """Compute bootstrap confidence interval with fixed seed."""
+    np.random.seed(seed)
     values = values[~np.isnan(values)]
     if len(values) < 10:
         return np.nan, np.nan, np.nan
@@ -132,16 +138,14 @@ def reliability_and_calibration(pred: np.ndarray, actual: np.ndarray, n_bins: in
     y = np.abs(actual).ravel()
     p = np.abs(pred).ravel()
     
-    # Remove NaN/Inf
     mask = np.isfinite(y) & np.isfinite(p)
     y, p = y[mask], p[mask]
     
     if len(y) < 100:
         return np.nan, np.nan, np.nan, np.array([])
     
-    # Bin by predicted magnitude
     bins = np.quantile(p, np.linspace(0, 1, n_bins + 1))
-    bins[-1] += 1e-6  # Ensure last bin includes max
+    bins[-1] += 1e-6
     
     ece = 0.0
     bin_stats = []
@@ -155,7 +159,6 @@ def reliability_and_calibration(pred: np.ndarray, actual: np.ndarray, n_bins: in
         ece += np.abs(bin_pred - bin_obs) * m.mean()
         bin_stats.append((bin_pred, bin_obs, m.sum()))
     
-    # Calibration slope/intercept
     slope, intercept, r, _, _ = stats.linregress(p, y)
     
     return ece, slope, intercept, np.array(bin_stats)
@@ -184,15 +187,12 @@ def compute_ndcg(pred: np.ndarray, actual: np.ndarray, k: int = 50) -> float:
     if n < k:
         k = n
     
-    # Use actual as relevance, pred for ranking
     pred_order = np.argsort(-np.abs(pred))[:k]
     ideal_order = np.argsort(-np.abs(actual))[:k]
     
-    # DCG
     relevance = np.abs(actual[pred_order])
     dcg = np.sum(relevance / np.log2(np.arange(2, k + 2)))
     
-    # IDCG
     ideal_relevance = np.abs(actual[ideal_order])
     idcg = np.sum(ideal_relevance / np.log2(np.arange(2, k + 2)))
     
@@ -202,6 +202,45 @@ def compute_ndcg(pred: np.ndarray, actual: np.ndarray, k: int = 50) -> float:
     return dcg / idcg
 
 
+def edge_pr_curve(grn_abs: np.ndarray, prior_edges: np.ndarray
+                  ) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Compute precision-recall for edge recovery."""
+    scores = grn_abs.ravel()
+    labels = prior_edges.astype(int).ravel()
+    
+    if labels.sum() == 0 or labels.sum() == len(labels):
+        return np.array([]), np.array([]), 0.0
+    
+    precision, recall, _ = precision_recall_curve(labels, scores)
+    aupr = average_precision_score(labels, scores)
+    
+    return precision, recall, aupr
+
+
+def load_tf_gene_omnipath(omnipath_dir: str, n_tfs: int, n_genes: int) -> np.ndarray:
+    """Load TF→Gene matrix from OmniPath for baseline comparison."""
+    path = Path(omnipath_dir) / 'gene_tf_signaling.npy'
+    if path.exists():
+        mat = np.load(path)  # (n_genes, n_tfs) from preprocessing
+        out = np.zeros((n_genes, n_tfs), dtype=np.float32)
+        g = min(mat.shape[0], n_genes)
+        t = min(mat.shape[1], n_tfs)
+        out[:g, :t] = mat[:g, :t]
+        return out
+    
+    # Try alternative filename
+    path2 = Path(omnipath_dir) / 'tf_gene_signaling_omnipath.npy'
+    if path2.exists():
+        mat = np.load(path2)
+        out = np.zeros((n_tfs, n_genes), dtype=np.float32)
+        t = min(mat.shape[0], n_tfs)
+        g = min(mat.shape[1], n_genes)
+        out[:t, :g] = mat[:t, :g]
+        return out.T  # Return as (n_genes, n_tfs)
+    
+    return np.zeros((n_genes, n_tfs), dtype=np.float32)
+
+
 # =============================================================================
 # BASELINE MODELS
 # =============================================================================
@@ -209,7 +248,7 @@ def compute_ndcg(pred: np.ndarray, actual: np.ndarray, k: int = 50) -> float:
 class NoChangeBaseline:
     """Baseline: predict no change (delta = 0)."""
     def predict(self, X):
-        return np.zeros_like(X)
+        return np.zeros((X.shape[0], X.shape[1] if len(X.shape) > 1 else 1))
 
 
 class ChIPOnlyBaseline:
@@ -219,6 +258,15 @@ class ChIPOnlyBaseline:
     
     def predict(self, tf_changes: np.ndarray) -> np.ndarray:
         return tf_changes @ self.binding.T
+
+
+class OmniPathOnlyBaseline:
+    """Linear model using only OmniPath TF→Gene matrix."""
+    def __init__(self, tf_gene_matrix: np.ndarray):
+        self.tf_gene = tf_gene_matrix  # (n_genes, n_tfs)
+    
+    def predict(self, tf_changes: np.ndarray) -> np.ndarray:
+        return tf_changes @ self.tf_gene.T
 
 
 class RidgeDeltaBaseline:
@@ -267,7 +315,12 @@ class NatureMetricsEvaluator:
         
         print("=" * 70)
         print("NATURE-LEVEL METRICS EVALUATION (COMPREHENSIVE)")
+        print(f"Random seed: {RANDOM_SEED}")
         print("=" * 70)
+        
+        # Set global seed
+        np.random.seed(RANDOM_SEED)
+        torch.manual_seed(RANDOM_SEED)
         
         # Load data
         print("\n[1/5] Loading data...")
@@ -291,6 +344,8 @@ class NatureMetricsEvaluator:
         print("\n[4/5] Loading OmniPath...")
         self.has_omnipath = False
         self.omnipath_path = omnipath_path
+        self.tf_gene_omnipath = None
+        
         if omnipath_path:
             self.gene_gene, self.gene_tf, self.tf_tf_omnipath = load_omnipath(
                 omnipath_path, len(self.gene_names), len(self.tf_names),
@@ -301,6 +356,10 @@ class NatureMetricsEvaluator:
             else:
                 self.tf_tf_combined = self.tf_tf_adj
             self.has_omnipath = True
+            
+            # Load TF→Gene for baseline
+            self.tf_gene_omnipath = load_tf_gene_omnipath(omnipath_path, self.n_tfs, self.n_genes)
+            print(f"  OmniPath TF→Gene edges: {(self.tf_gene_omnipath != 0).sum()}")
         else:
             self.gene_gene = np.zeros((self.n_genes, self.n_genes), dtype=np.float32)
             self.gene_tf = np.zeros((self.n_genes, self.n_tfs), dtype=np.float32)
@@ -319,6 +378,9 @@ class NatureMetricsEvaluator:
         
         # Storage for results
         self.results = {}
+        
+        # Store predictions for reuse
+        self._cached_predictions = None
     
     def _load_model(self, model_path: str, ppi_path: Optional[str]) -> IntegratedGRNModelV7:
         checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
@@ -338,7 +400,6 @@ class NatureMetricsEvaluator:
             use_gene_tf_modulation=self.has_omnipath
         )
         
-        # Load PPI
         cof_to_tf = None
         cof_indices = None
         if ppi_path:
@@ -369,8 +430,8 @@ class NatureMetricsEvaluator:
     
     def _create_datasets(self):
         """Create train/val splits for evaluation."""
+        np.random.seed(RANDOM_SEED)
         n_holdout = max(2, self.n_celltypes // 6)
-        np.random.seed(42)
         holdout = set(np.random.choice(self.n_celltypes, n_holdout, replace=False))
         train_idx = [i for i in range(self.n_celltypes) if i not in holdout]
         
@@ -384,11 +445,15 @@ class NatureMetricsEvaluator:
         """Precompute gene-level statistics for stratification."""
         self.gene_expr_mean = self.expression.mean(axis=0)
         self.gene_expr_var = self.expression.var(axis=0)
-        self.gene_chip_density = self.binding_matrix.sum(axis=1)  # Number of TFs binding
+        self.gene_chip_density = self.binding_matrix.sum(axis=1)
     
-    def _collect_predictions(self, pairs: List[Tuple[int, int]], max_samples: int = 5000
-                            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _collect_predictions(self, pairs: List[Tuple[int, int]], max_samples: int = 5000,
+                             use_cache: bool = True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Collect model predictions for given pairs."""
+        # Use cache for val pairs
+        if use_cache and pairs == self.val_pairs and self._cached_predictions is not None:
+            return self._cached_predictions
+        
         dataset = MultiTFDataset(
             expression_means=self.expression,
             tf_activity=self.tf_activity,
@@ -424,12 +489,18 @@ class NatureMetricsEvaluator:
                 
                 n_collected += len(pred_delta)
         
-        return (
+        result = (
             np.concatenate(all_pred, axis=0)[:max_samples],
             np.concatenate(all_actual, axis=0)[:max_samples],
             np.concatenate(all_tf_change, axis=0)[:max_samples],
             np.concatenate(all_source, axis=0)[:max_samples]
         )
+        
+        # Cache val predictions
+        if pairs == self.val_pairs:
+            self._cached_predictions = result
+        
+        return result
     
     # =========================================================================
     # 1. PER-GENE ΔPCC DISTRIBUTION
@@ -446,7 +517,6 @@ class NatureMetricsEvaluator:
         pccs = compute_per_gene_pcc(pred, actual)
         spearman = compute_per_gene_spearman(pred, actual)
         
-        # Filter valid
         valid_pccs = pccs[~np.isnan(pccs)]
         valid_spearman = spearman[~np.isnan(spearman)]
         
@@ -483,47 +553,53 @@ class NatureMetricsEvaluator:
         return results
     
     # =========================================================================
-    # 2. AUPRC/AUROC FOR UP VS DOWN
+    # 2. AUPRC/AUROC FOR UP VS DOWN (MULTIPLE THRESHOLDS)
     # =========================================================================
     
-    def evaluate_classification_metrics(self, threshold: float = 0.1) -> Dict:
-        """Compute AUPRC/AUROC for up vs down regulation."""
+    def evaluate_classification_metrics(self, thresholds: List[float] = [0.1, 0.2]) -> Dict:
+        """Compute AUPRC/AUROC for up vs down regulation at multiple thresholds."""
         print("\n" + "=" * 70)
         print("2. AUPRC/AUROC FOR UP VS DOWN REGULATION")
         print("=" * 70)
         
         pred, actual, _, _ = self._collect_predictions(self.val_pairs)
         
-        # Only consider non-trivial changes
-        mask = np.abs(actual) > threshold
+        results = {'thresholds': {}}
         
-        y_true = (actual[mask] > 0).astype(int).flatten()
-        y_score = pred[mask].flatten()
+        for threshold in thresholds:
+            mask = np.abs(actual) > threshold
+            
+            y_true = (actual[mask] > 0).astype(int).flatten()
+            y_score = pred[mask].flatten()
+            
+            if len(np.unique(y_true)) < 2:
+                continue
+            
+            auroc = roc_auc_score(y_true, y_score)
+            auprc = average_precision_score(y_true, y_score)
+            
+            y_pred = (y_score > 0).astype(int)
+            dir_acc = (y_true == y_pred).mean()
+            
+            # R² on masked deltas
+            r2_masked = r2_score(actual[mask].flatten(), pred[mask].flatten())
+            
+            results['thresholds'][str(threshold)] = {
+                'auroc': float(auroc),
+                'auprc': float(auprc),
+                'direction_accuracy': float(dir_acc),
+                'r2_masked': float(r2_masked),
+                'n_samples': int(mask.sum())
+            }
+            
+            print(f"  Threshold {threshold}:")
+            print(f"    AUROC: {auroc:.4f}, AUPRC: {auprc:.4f}")
+            print(f"    Dir Acc: {dir_acc:.1%}, R²: {r2_masked:.4f}")
         
-        # Compute metrics
-        auroc = roc_auc_score(y_true, y_score)
-        auprc = average_precision_score(y_true, y_score)
-        
-        # Direction accuracy
-        y_pred = (y_score > 0).astype(int)
-        dir_acc = (y_true == y_pred).mean()
-        
-        # R² on deltas
-        r2 = r2_score(actual.flatten(), pred.flatten())
-        
-        results = {
-            'auroc': float(auroc),
-            'auprc': float(auprc),
-            'direction_accuracy': float(dir_acc),
-            'r2_delta': float(r2),
-            'n_samples': int(mask.sum()),
-            'threshold': threshold
-        }
-        
-        print(f"  AUROC: {results['auroc']:.4f}")
-        print(f"  AUPRC: {results['auprc']:.4f}")
-        print(f"  Direction Accuracy: {results['direction_accuracy']:.1%}")
-        print(f"  R² on deltas: {results['r2_delta']:.4f}")
+        # Global R²
+        r2_global = r2_score(actual.flatten(), pred.flatten())
+        results['r2_global'] = float(r2_global)
+        print(f"  Global R² on all deltas: {r2_global:.4f}")
         
         self.results['classification'] = results
         
@@ -541,21 +617,15 @@ class NatureMetricsEvaluator:
         
         pred_full, actual, tf_change, source = self._collect_predictions(self.val_pairs)
         
-        # Full model baseline
         full_pccs = compute_per_gene_pcc(pred_full, actual)
         full_mean, full_lo, full_hi = bootstrap_ci(full_pccs, n_bootstrap)
         
         results = {
-            'full_model': {
-                'mean_pcc': full_mean,
-                'ci_lower': full_lo,
-                'ci_upper': full_hi
-            }
+            'full_model': {'mean_pcc': full_mean, 'ci_lower': full_lo, 'ci_upper': full_hi}
         }
         
         print(f"  Full model: {full_mean:.4f} [{full_lo:.4f}, {full_hi:.4f}]")
         
-        # Helper to run ablation
         def run_ablation(attr_name, flag_value):
             if not hasattr(self.model, attr_name):
                 return None
@@ -640,7 +710,7 @@ class NatureMetricsEvaluator:
         
         pred_full, actual, tf_change, source = self._collect_predictions(self.val_pairs)
         
-        np.random.seed(42)
+        np.random.seed(RANDOM_SEED + 1)  # Different seed for TF selection
         holdout_tfs = np.random.choice(self.n_tfs, n_holdout_tfs, replace=False)
         
         tf_change_masked = tf_change.copy()
@@ -676,11 +746,11 @@ class NatureMetricsEvaluator:
         return results
     
     # =========================================================================
-    # 5. DELTA BASELINES
+    # 5. DELTA BASELINES (INCLUDING OMNIPATH)
     # =========================================================================
     
     def evaluate_baselines(self, n_bootstrap: int = 100) -> Dict:
-        """Compare against delta baselines."""
+        """Compare against delta baselines including OmniPath."""
         print("\n" + "=" * 70)
         print("5. DELTA BASELINES COMPARISON")
         print("=" * 70)
@@ -688,6 +758,7 @@ class NatureMetricsEvaluator:
         pred_model, actual, tf_change, source = self._collect_predictions(self.val_pairs)
         
         results = {}
+        baseline_means = []
         
         # Our model
         model_pccs = compute_per_gene_pcc(pred_model, actual)
@@ -704,6 +775,7 @@ class NatureMetricsEvaluator:
         nochange_pccs = compute_per_gene_pcc(pred_nochange, actual)
         nochange_mean, nochange_lo, nochange_hi = bootstrap_ci(nochange_pccs, n_bootstrap)
         results['no_change'] = {'mean_pcc': nochange_mean, 'ci_lower': nochange_lo, 'ci_upper': nochange_hi}
+        baseline_means.append(nochange_mean)
         print(f"  No-change: {nochange_mean:.4f} [{nochange_lo:.4f}, {nochange_hi:.4f}]")
         
         # Baseline 2: ChIP-only linear
@@ -716,11 +788,40 @@ class NatureMetricsEvaluator:
             'mean_pcc': chip_mean, 'ci_lower': chip_lo, 'ci_upper': chip_hi,
             'r2': chip_r2
         }
+        baseline_means.append(chip_mean)
         print(f"  ChIP-only: {chip_mean:.4f} [{chip_lo:.4f}, {chip_hi:.4f}] (R²={chip_r2:.4f})")
         
-        # Baseline 3: Ridge regression
+        # Baseline 3: OmniPath-only TF→Gene
+        if self.tf_gene_omnipath is not None and (self.tf_gene_omnipath != 0).sum() > 0:
+            omni_baseline = OmniPathOnlyBaseline(self.tf_gene_omnipath)
+            pred_omni = omni_baseline.predict(tf_change)
+            omni_pccs = compute_per_gene_pcc(pred_omni, actual)
+            omni_mean, omni_lo, omni_hi = bootstrap_ci(omni_pccs, n_bootstrap)
+            omni_r2 = r2_score(actual.flatten(), pred_omni.flatten())
+            results['omnipath_only'] = {
+                'mean_pcc': omni_mean, 'ci_lower': omni_lo, 'ci_upper': omni_hi,
+                'r2': omni_r2
+            }
+            baseline_means.append(omni_mean)
+            print(f"  OmniPath-only: {omni_mean:.4f} [{omni_lo:.4f}, {omni_hi:.4f}] (R²={omni_r2:.4f})")
+            
+            # Baseline 4: ChIP + OmniPath combined
+            pred_chip_omni = pred_chip + pred_omni
+            chipomni_pccs = compute_per_gene_pcc(pred_chip_omni, actual)
+            chipomni_mean, chipomni_lo, chipomni_hi = bootstrap_ci(chipomni_pccs, n_bootstrap)
+            chipomni_r2 = r2_score(actual.flatten(), pred_chip_omni.flatten())
+            results['chip_plus_omnipath'] = {
+                'mean_pcc': chipomni_mean, 'ci_lower': chipomni_lo, 'ci_upper': chipomni_hi,
+                'r2': chipomni_r2
+            }
+            baseline_means.append(chipomni_mean)
+            print(f"  ChIP+OmniPath: {chipomni_mean:.4f} [{chipomni_lo:.4f}, {chipomni_hi:.4f}] (R²={chipomni_r2:.4f})")
+        
+        # Baseline 5: Ridge regression
         print("  Fitting Ridge baseline...")
-        train_pred, train_actual, train_tf, _ = self._collect_predictions(self.train_pairs, max_samples=2000)
+        train_pred, train_actual, train_tf, _ = self._collect_predictions(
+            self.train_pairs, max_samples=2000, use_cache=False
+        )
         
         ridge = RidgeDeltaBaseline(alpha=1.0)
         ridge.fit(train_tf, train_actual)
@@ -733,19 +834,19 @@ class NatureMetricsEvaluator:
             'mean_pcc': ridge_mean, 'ci_lower': ridge_lo, 'ci_upper': ridge_hi,
             'r2': ridge_r2
         }
+        baseline_means.append(ridge_mean)
         print(f"  Ridge: {ridge_mean:.4f} [{ridge_lo:.4f}, {ridge_hi:.4f}] (R²={ridge_r2:.4f})")
         
-        # Store ridge for hard gene analysis
         self.ridge_pccs = ridge_pccs
         
         # Improvement over best baseline
-        best_baseline = max(nochange_mean, chip_mean, ridge_mean)
+        best_baseline = max(baseline_means)
         improvement = model_mean - best_baseline
         results['improvement_vs_best_baseline'] = improvement
         print(f"\n  Improvement vs best baseline: +{improvement:.4f}")
         
         # Hard genes: bottom quartile of Ridge ΔPCC
-        hard_gene_mask = ridge_pccs < np.percentile(ridge_pccs[~np.isnan(ridge_pccs)], 25)
+        hard_gene_mask = ridge_pccs < np.nanpercentile(ridge_pccs[~np.isnan(ridge_pccs)], 25)
         if hard_gene_mask.sum() > 0:
             model_hard = model_pccs[hard_gene_mask]
             ridge_hard = ridge_pccs[hard_gene_mask]
@@ -779,7 +880,7 @@ class NatureMetricsEvaluator:
             if len(pairs) == 0:
                 continue
             
-            pred, actual, _, _ = self._collect_predictions(pairs, max_samples=1000)
+            pred, actual, _, _ = self._collect_predictions(pairs, max_samples=1000, use_cache=False)
             pccs = compute_per_gene_pcc(pred, actual)
             valid_pccs = pccs[~np.isnan(pccs)]
             
@@ -833,6 +934,11 @@ class NatureMetricsEvaluator:
         
         self.results['calibration'] = results
         self.calibration_bin_stats = bin_stats
+        
+        # Store residuals for diagnostics
+        self.residuals = actual.flatten() - pred.flatten()
+        self.pred_flat = pred.flatten()
+        
         return results
     
     # =========================================================================
@@ -847,12 +953,10 @@ class NatureMetricsEvaluator:
         
         pred, actual, _, _ = self._collect_predictions(self.val_pairs)
         
-        # Use |predicted delta| as confidence
         conf = np.abs(pred)
         
         cov, mae_cov, dir_acc_cov = risk_coverage(pred, actual, conf)
         
-        # Sample at key coverage levels
         results = {
             'coverage_levels': [0.1, 0.25, 0.5, 0.75, 1.0],
             'mae_at_coverage': {},
@@ -917,7 +1021,7 @@ class NatureMetricsEvaluator:
         
         results = {}
         
-        # By expression variance (deciles)
+        # By expression variance
         var_deciles = pd.qcut(self.gene_expr_var, 10, labels=False, duplicates='drop')
         var_groups = {}
         for d in range(10):
@@ -930,7 +1034,7 @@ class NatureMetricsEvaluator:
         
         results['by_expression_variance'] = var_groups
         
-        # By ChIP density (deciles)
+        # By ChIP density
         density_deciles = pd.qcut(self.gene_chip_density, 10, labels=False, duplicates='drop')
         density_groups = {}
         for d in range(10):
@@ -943,7 +1047,6 @@ class NatureMetricsEvaluator:
         
         results['by_chip_density'] = density_groups
         
-        # Correlation between ΔPCC and attributes
         valid_mask = ~np.isnan(self.gene_pccs)
         if valid_mask.sum() > 100:
             corr_var, _ = stats.spearmanr(self.gene_pccs[valid_mask], self.gene_expr_var[valid_mask])
@@ -959,29 +1062,31 @@ class NatureMetricsEvaluator:
         return results
     
     # =========================================================================
-    # 11. PRIOR CONSISTENCY AND EDGE OVERLAP
+    # 11. PRIOR CONSISTENCY AND EDGE OVERLAP PR CURVES
     # =========================================================================
     
     def evaluate_prior_consistency(self) -> Dict:
-        """Check consistency with OmniPath/ChIP priors."""
+        """Check consistency with OmniPath/ChIP priors with PR curves."""
         print("\n" + "=" * 70)
         print("11. PRIOR CONSISTENCY AND EDGE OVERLAP")
         print("=" * 70)
         
-        # Get learned GRN
         grn = self.model.get_grn_matrix().detach().cpu().numpy()
+        grn_abs = np.abs(grn)
         
         results = {}
         
-        # ChIP overlap
+        # ChIP overlap PR curve
         chip_edges = self.binding_matrix > 0
-        grn_edges = np.abs(grn) > np.percentile(np.abs(grn), 90)
+        prec_chip, rec_chip, aupr_chip = edge_pr_curve(grn_abs, chip_edges)
         
+        grn_edges = grn_abs > np.percentile(grn_abs, 90)
         overlap = (chip_edges & grn_edges).sum()
         chip_total = chip_edges.sum()
         grn_top_total = grn_edges.sum()
         
         results['chip_overlap'] = {
+            'aupr': float(aupr_chip),
             'overlap_count': int(overlap),
             'chip_edges': int(chip_total),
             'grn_top10pct_edges': int(grn_top_total),
@@ -989,16 +1094,33 @@ class NatureMetricsEvaluator:
             'recall': float(overlap / chip_total) if chip_total > 0 else 0
         }
         
-        print(f"  ChIP overlap (top 10% GRN edges):")
-        print(f"    Precision: {results['chip_overlap']['precision']:.1%}")
-        print(f"    Recall: {results['chip_overlap']['recall']:.1%}")
+        print(f"  ChIP edge recovery:")
+        print(f"    AUPR: {results['chip_overlap']['aupr']:.4f}")
+        print(f"    Precision (top 10%): {results['chip_overlap']['precision']:.1%}")
+        print(f"    Recall (top 10%): {results['chip_overlap']['recall']:.1%}")
         
-        # Sign consistency with ChIP (where signs exist)
-        # For ChIP, assume positive binding = potential activation
+        # Store for plotting
+        self.chip_pr = (prec_chip, rec_chip, aupr_chip)
+        
+        # OmniPath overlap PR curve
+        if self.tf_gene_omnipath is not None and (self.tf_gene_omnipath != 0).sum() > 0:
+            omni_edges = self.tf_gene_omnipath != 0
+            prec_omni, rec_omni, aupr_omni = edge_pr_curve(grn_abs, omni_edges)
+            
+            results['omnipath_overlap'] = {
+                'aupr': float(aupr_omni),
+                'omnipath_edges': int(omni_edges.sum())
+            }
+            print(f"  OmniPath edge recovery:")
+            print(f"    AUPR: {results['omnipath_overlap']['aupr']:.4f}")
+            
+            self.omni_pr = (prec_omni, rec_omni, aupr_omni)
+        
+        # Sign consistency
         chip_positive = self.binding_matrix > 0
         grn_positive = grn > 0
         
-        both_edges = chip_positive & (np.abs(grn) > np.percentile(np.abs(grn), 50))
+        both_edges = chip_positive & (grn_abs > np.percentile(grn_abs, 50))
         if both_edges.sum() > 0:
             sign_consistent = (chip_positive[both_edges] == grn_positive[both_edges]).mean()
             results['sign_consistency'] = float(sign_consistent)
@@ -1029,8 +1151,8 @@ class NatureMetricsEvaluator:
         
         print(f"  Clean: ΔPCC={clean_pcc:.4f}")
         
-        # Noise tests
         for sigma in sigmas:
+            np.random.seed(RANDOM_SEED + 10)
             noisy_tf = tf_change + np.random.normal(0, sigma, tf_change.shape)
             
             with torch.no_grad():
@@ -1046,8 +1168,8 @@ class NatureMetricsEvaluator:
             results['noise_tests'][f'sigma_{sigma}'] = float(noisy_pcc)
             print(f"  Noise σ={sigma}: ΔPCC={noisy_pcc:.4f} (drop={clean_pcc - noisy_pcc:.4f})")
         
-        # Shuffle control (sanity check - should give ~0)
-        np.random.seed(123)
+        # Shuffle control
+        np.random.seed(RANDOM_SEED + 20)
         shuffled_tf = tf_change.copy()
         for i in range(shuffled_tf.shape[0]):
             np.random.shuffle(shuffled_tf[i])
@@ -1078,7 +1200,7 @@ class NatureMetricsEvaluator:
         print("CREATING FIGURES")
         print("=" * 70)
         
-        # Main summary figure (2x3)
+        # Figure 1: Main summary (2x3)
         fig, axes = plt.subplots(2, 3, figsize=(18, 12))
         
         # A. Per-gene PCC distribution
@@ -1136,7 +1258,7 @@ class NatureMetricsEvaluator:
             colors = ['#2ca02c' if 'bridge' in n.lower() else '#1f77b4' for n in names]
             ax.bar(x, means, yerr=np.array(errors).T, capsize=5, color=colors, alpha=0.7)
             ax.set_xticks(x)
-            ax.set_xticklabels(names, fontsize=9)
+            ax.set_xticklabels(names, fontsize=8, rotation=45, ha='right')
             ax.set_ylabel('Mean Per-Gene ΔPCC', fontsize=12)
             ax.set_title('C. Baseline Comparison', fontsize=14, fontweight='bold')
         
@@ -1146,7 +1268,8 @@ class NatureMetricsEvaluator:
             bin_pred = self.calibration_bin_stats[:, 0]
             bin_obs = self.calibration_bin_stats[:, 1]
             ax.scatter(bin_pred, bin_obs, s=100, c='steelblue', alpha=0.7)
-            ax.plot([0, max(bin_pred)], [0, max(bin_pred)], 'r--', lw=2, label='Perfect calibration')
+            max_val = max(max(bin_pred), max(bin_obs))
+            ax.plot([0, max_val], [0, max_val], 'r--', lw=2, label='Perfect calibration')
             ax.set_xlabel('Predicted |Δ|', fontsize=12)
             ax.set_ylabel('Observed |Δ|', fontsize=12)
             ax.set_title('D. Calibration (Reliability Diagram)', fontsize=14, fontweight='bold')
@@ -1183,12 +1306,12 @@ class NatureMetricsEvaluator:
         plt.close()
         print(f"  Saved: nature_metrics_summary.png")
         
-        # Additional figure: Stratification
-        if 'stratification' in self.results and hasattr(self, 'gene_pccs'):
-            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-            
-            # By expression variance
-            ax = axes[0]
+        # Figure 2: Stratification and residual diagnostics (2x2)
+        fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+        
+        # G. By expression variance
+        ax = axes[0, 0]
+        if 'stratification' in self.results:
             var_data = self.results['stratification'].get('by_expression_variance', {})
             if var_data:
                 x = list(range(len(var_data)))
@@ -1197,9 +1320,10 @@ class NatureMetricsEvaluator:
                 ax.set_xlabel('Expression Variance Decile', fontsize=12)
                 ax.set_ylabel('Median ΔPCC', fontsize=12)
                 ax.set_title('G. Performance by Expression Variance', fontsize=14, fontweight='bold')
-            
-            # By ChIP density
-            ax = axes[1]
+        
+        # H. By ChIP density
+        ax = axes[0, 1]
+        if 'stratification' in self.results:
             density_data = self.results['stratification'].get('by_chip_density', {})
             if density_data:
                 x = list(range(len(density_data)))
@@ -1208,11 +1332,76 @@ class NatureMetricsEvaluator:
                 ax.set_xlabel('ChIP Density Decile', fontsize=12)
                 ax.set_ylabel('Median ΔPCC', fontsize=12)
                 ax.set_title('H. Performance by ChIP Density', fontsize=14, fontweight='bold')
+        
+        # I. Residual vs predicted scatter
+        ax = axes[1, 0]
+        if hasattr(self, 'residuals') and hasattr(self, 'pred_flat'):
+            # Subsample for visibility
+            n_plot = min(10000, len(self.residuals))
+            idx = np.random.choice(len(self.residuals), n_plot, replace=False)
+            ax.scatter(np.abs(self.pred_flat[idx]), np.abs(self.residuals[idx]), 
+                       alpha=0.1, s=1, c='steelblue')
+            ax.set_xlabel('|Predicted Δ|', fontsize=12)
+            ax.set_ylabel('|Residual|', fontsize=12)
+            ax.set_title('I. Residual vs Predicted Magnitude', fontsize=14, fontweight='bold')
+        
+        # J. QQ-plot of residuals
+        ax = axes[1, 1]
+        if hasattr(self, 'residuals'):
+            # Subsample for QQ plot
+            n_qq = min(5000, len(self.residuals))
+            sample_residuals = np.random.choice(self.residuals, n_qq, replace=False)
+            stats.probplot(sample_residuals, dist="norm", plot=ax)
+            ax.set_title('J. QQ-Plot of Residuals', fontsize=14, fontweight='bold')
+        
+        plt.tight_layout()
+        plt.savefig(output_dir / 'nature_metrics_diagnostics.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved: nature_metrics_diagnostics.png")
+        
+        # Figure 3: Prior overlap PR curves and cell-type heatmap (1x2)
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # K. Prior overlap PR curves
+        ax = axes[0]
+        if hasattr(self, 'chip_pr'):
+            prec, rec, aupr = self.chip_pr
+            if len(prec) > 0:
+                ax.plot(rec, prec, 'b-', lw=2, label=f'ChIP (AUPR={aupr:.3f})')
+        if hasattr(self, 'omni_pr'):
+            prec, rec, aupr = self.omni_pr
+            if len(prec) > 0:
+                ax.plot(rec, prec, 'r-', lw=2, label=f'OmniPath (AUPR={aupr:.3f})')
+        ax.set_xlabel('Recall', fontsize=12)
+        ax.set_ylabel('Precision', fontsize=12)
+        ax.set_title('K. Edge Recovery PR Curves', fontsize=14, fontweight='bold')
+        ax.legend(fontsize=10)
+        ax.set_xlim([0, 1])
+        ax.set_ylim([0, 1])
+        
+        # L. Per-cell-type heatmap
+        ax = axes[1]
+        if hasattr(self, 'celltype_pccs') and self.celltype_pccs:
+            ct_names = list(self.celltype_pccs.keys())
+            ct_medians = [self.celltype_pccs[ct]['median'] for ct in ct_names]
             
-            plt.tight_layout()
-            plt.savefig(output_dir / 'nature_metrics_stratification.png', dpi=300, bbox_inches='tight')
-            plt.close()
-            print(f"  Saved: nature_metrics_stratification.png")
+            # Sort by median
+            sorted_idx = np.argsort(ct_medians)[::-1]
+            ct_names_sorted = [ct_names[i] for i in sorted_idx]
+            ct_medians_sorted = [ct_medians[i] for i in sorted_idx]
+            
+            colors = plt.cm.RdYlGn([(m + 1) / 2 for m in ct_medians_sorted])  # Map -1 to 1 to colormap
+            ax.barh(range(len(ct_names_sorted)), ct_medians_sorted, color=colors)
+            ax.set_yticks(range(len(ct_names_sorted)))
+            ax.set_yticklabels(ct_names_sorted, fontsize=8)
+            ax.set_xlabel('Median ΔPCC', fontsize=12)
+            ax.set_title('L. Per-Cell-Type Performance', fontsize=14, fontweight='bold')
+            ax.invert_yaxis()
+        
+        plt.tight_layout()
+        plt.savefig(output_dir / 'nature_metrics_priors.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved: nature_metrics_priors.png")
     
     # =========================================================================
     # RUN ALL
@@ -1245,7 +1434,7 @@ class NatureMetricsEvaluator:
         with open(output_dir / 'nature_metrics.json', 'w') as f:
             json.dump(self.results, f, indent=2, default=str)
         
-        # Save per-gene PCCs
+        # Save per-gene metrics
         if hasattr(self, 'gene_pccs'):
             df = pd.DataFrame({
                 'gene': self.gene_names,
@@ -1258,6 +1447,7 @@ class NatureMetricsEvaluator:
         
         # Save model card
         model_card = {
+            'random_seed': RANDOM_SEED,
             'dataset': 'SCLC single-cell',
             'n_celltypes': self.n_celltypes,
             'n_genes': self.n_genes,
@@ -1266,7 +1456,8 @@ class NatureMetricsEvaluator:
             'val_pairs': len(self.val_pairs),
             'train_pairs': len(self.train_pairs),
             'priors_used': ['ChIP-Atlas', 'OmniPath', 'Rosetta PPI'],
-            'metrics_threshold': 0.1
+            'classification_thresholds': [0.1, 0.2],
+            'bootstrap_samples': 100
         }
         with open(output_dir / 'model_card.json', 'w') as f:
             json.dump(model_card, f, indent=2)
@@ -1317,16 +1508,22 @@ def main():
         print(f"  Genes with ΔPCC>0.5: {pgp['frac_above_0.5']:.1%}")
     
     if 'classification' in results:
-        cls = results['classification']
-        print(f"\nClassification: AUROC={cls['auroc']:.3f}, AUPRC={cls['auprc']:.3f}, R²={cls['r2_delta']:.3f}")
+        print(f"\nGlobal R² on deltas: {results['classification']['r2_global']:.3f}")
+        for thresh, metrics in results['classification'].get('thresholds', {}).items():
+            print(f"  Threshold {thresh}: AUROC={metrics['auroc']:.3f}, "
+                  f"AUPRC={metrics['auprc']:.3f}, R²={metrics['r2_masked']:.3f}")
     
     if 'baselines' in results:
-        base = results['baselines']
-        print(f"\nImprovement vs best baseline: +{base['improvement_vs_best_baseline']:.3f}")
+        print(f"\nImprovement vs best baseline: +{results['baselines']['improvement_vs_best_baseline']:.3f}")
+    
+    if 'prior_consistency' in results:
+        pc = results['prior_consistency']
+        print(f"\nEdge recovery AUPR: ChIP={pc['chip_overlap']['aupr']:.3f}")
+        if 'omnipath_overlap' in pc:
+            print(f"                   OmniPath={pc['omnipath_overlap']['aupr']:.3f}")
     
     if 'robustness' in results:
-        rob = results['robustness']
-        print(f"\nRobustness: Shuffle control ΔPCC={rob['shuffle_control']:.3f} (validates model)")
+        print(f"\nShuffle control: ΔPCC={results['robustness']['shuffle_control']:.3f} (validates model)")
 
 
 if __name__ == '__main__':
