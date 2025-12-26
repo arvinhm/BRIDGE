@@ -546,8 +546,17 @@ def run_neighborhood_analysis(
             if abs(w) > 0.001:  # Non-trivial effect
                 G.add_edge(t_name, target_gene, weight=w, role='tf->target')
         
-        # Layout
-        pos = nx.kamada_kawai_layout(G)
+        # Layout - use spring layout (works with any weights) or kamada_kawai with abs weights
+        # Create a copy with absolute weights for layout calculation
+        G_layout = G.copy()
+        for u, v, d in G_layout.edges(data=True):
+            d['weight'] = abs(d.get('weight', 1.0)) + 0.1  # Ensure positive
+        
+        try:
+            pos = nx.kamada_kawai_layout(G_layout)
+        except ValueError:
+            # Fallback to spring layout if kamada_kawai fails
+            pos = nx.spring_layout(G, seed=42, k=2.0)
         
         # Edge styling
         edge_colors = []
