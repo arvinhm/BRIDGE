@@ -500,7 +500,7 @@ def run_neighborhood_analysis(
     print(f"    Saved: {target_gene}_gene_sensitivity.csv")
     
     # =========================================================================
-    # 3. Neighborhood Graph Visualization
+    # 3. Neighborhood Graph Visualization (CLEAN VERSION)
     # =========================================================================
     print("\n  [3/3] Creating neighborhood graph...")
     
@@ -508,111 +508,200 @@ def run_neighborhood_analysis(
         import networkx as nx
         import matplotlib.pyplot as plt
         
+        # Limit to top 8 for cleaner visualization
+        n_show = min(8, top_k)
+        
         G = nx.DiGraph()
         
         # Target node
-        G.add_node(target_gene, kind='target')
+        G.add_node(target_gene, kind='target', layer=2)
         
-        # Add top gene nodes
-        for gi in top_gene_idx[:top_k]:
-            g_name = gene_names[gi]
-            if g_name != target_gene:
-                G.add_node(g_name, kind='gene')
+        # Add top TF nodes (only those with strong effects on target)
+        tf_effects = grn[target_gene_idx, :]
+        top_tfs_sorted = np.argsort(np.abs(tf_effects))[::-1][:n_show]
         
-        # Add top TF nodes
-        for ti in top_tfs_idx[:top_k]:
-            G.add_node(tf_names[ti], kind='tf')
+        tfs_added = []
+        for ti in top_tfs_sorted:
+            effect = tf_effects[ti]
+            if abs(effect) > 0.001:
+                tf_name = tf_names[ti]
+                G.add_node(tf_name, kind='tf', layer=1, effect=effect)
+                G.add_edge(tf_name, target_gene, weight=effect, role='tf->target')
+                tfs_added.append((ti, tf_name))
         
-        # Add edges: Gene→TF (weighted by path contribution)
-        if path_scores is not None:
-            # Threshold: keep only top edges (with safe fallback for sparse/zero matrices)
-            nonzero_scores = np.abs(path_scores[path_scores != 0])
-            threshold = np.percentile(nonzero_scores, 95) if nonzero_scores.size > 0 else 0.0
-            
-            for gi in top_gene_idx[:top_k]:
-                g_name = gene_names[gi]
-                if g_name == target_gene:
-                    continue
-                for ti in top_tfs_idx[:top_k]:
-                    t_name = tf_names[ti]
-                    w = gene_to_tf[gi, ti]
-                    if abs(w) > threshold * 0.1:  # Keep stronger edges
-                        G.add_edge(g_name, t_name, weight=w, role='gene->tf')
+        # Add top gene nodes (only those affecting the added TFs)
+        genes_added = set()
+        if gene_to_tf is not None:
+            for ti, tf_name in tfs_added[:5]:  # Only for top 5 TFs
+                # Find genes with strongest effects on this TF
+                gene_effects_on_tf = gene_to_tf[:, ti]
+                top_genes_for_tf = np.argsort(np.abs(gene_effects_on_tf))[::-1][:3]
+                
+                for gi in top_genes_for_tf:
+                    g_name = gene_names[gi]
+                    if g_name == target_gene or g_name in [t[1] for t in tfs_added]:
+                        continue
+                    effect = gene_effects_on_tf[gi]
+                    if abs(effect) > 0.01 and len(genes_added) < 10:
+                        if g_name not in genes_added:
+                            G.add_node(g_name, kind='gene', layer=0)
+                            genes_added.add(g_name)
+                        G.add_edge(g_name, tf_name, weight=effect, role='gene->tf')
         
-        # Add edges: TF→Target
-        for ti in top_tfs_idx[:top_k]:
-            t_name = tf_names[ti]
-            w = grn[target_gene_idx, ti]
-            if abs(w) > 0.001:  # Non-trivial effect
-                G.add_edge(t_name, target_gene, weight=w, role='tf->target')
+        if G.number_of_nodes() < 3:
+            print("    Not enough nodes for visualization")
+            return
         
-        # Layout - use spring layout (works with any weights) or kamada_kawai with abs weights
-        # Create a copy with absolute weights for layout calculation
-        G_layout = G.copy()
-        for u, v, d in G_layout.edges(data=True):
-            d['weight'] = abs(d.get('weight', 1.0)) + 0.1  # Ensure positive
+        # Create hierarchical layout (left to right: Genes → TFs → Target)
+        pos = {}
         
-        try:
-            pos = nx.kamada_kawai_layout(G_layout)
-        except ValueError:
-            # Fallback to spring layout if kamada_kawai fails
-            pos = nx.spring_layout(G, seed=42, k=2.0)
+        # Separate nodes by layer
+        gene_nodes = [n for n, d in G.nodes(data=True) if d.get('kind') == 'gene']
+        tf_nodes = [n for n, d in G.nodes(data=True) if d.get('kind') == 'tf']
+        target_nodes = [n for n, d in G.nodes(data=True) if d.get('kind') == 'target']
         
-        # Edge styling
+        # Position genes on left
+        for i, n in enumerate(gene_nodes):
+            pos[n] = (0, len(gene_nodes)/2 - i)
+        
+        # Position TFs in middle
+        for i, n in enumerate(tf_nodes):
+            pos[n] = (1.5, len(tf_nodes)/2 - i)
+        
+        # Position target on right
+        for i, n in enumerate(target_nodes):
+            pos[n] = (3, 0)
+        
+        # Edge colors and widths
         edge_colors = []
         edge_widths = []
-        max_weight = max(abs(d.get('weight', 0.1)) for _, _, d in G.edges(data=True)) + 1e-8
-        for u, v, d in G.edges(data=True):
-            if d.get('role') == 'gene->tf':
-                edge_colors.append('#2ca02c' if d.get('weight', 0) > 0 else '#d62728')
-            else:
-                edge_colors.append('#1f77b4' if d.get('weight', 0) > 0 else '#ff7f0e')
-            edge_widths.append(max(0.5, 3.0 * abs(d.get('weight', 0.1)) / max_weight))
+        edge_styles = []
         
-        # Node styling
+        for u, v, d in G.edges(data=True):
+            w = d.get('weight', 0)
+            role = d.get('role', '')
+            
+            # Color: green for activator, red for repressor
+            if w > 0:
+                edge_colors.append('#2ca02c')  # Green
+            else:
+                edge_colors.append('#d62728')  # Red
+            
+            # Width based on effect magnitude
+            edge_widths.append(max(1.0, min(5.0, 2.0 + 10 * abs(w))))
+            edge_styles.append('solid')
+        
+        # Node sizes and colors
+        node_sizes = []
         node_colors = []
         for n, d in G.nodes(data=True):
             kind = d.get('kind', 'gene')
             if kind == 'target':
-                node_colors.append('#fb8072')
+                node_sizes.append(2500)
+                node_colors.append('#FF6B6B')  # Coral red
             elif kind == 'tf':
-                node_colors.append('#bebada')
+                node_sizes.append(1800)
+                node_colors.append('#9B8CD9')  # Purple
             else:
-                node_colors.append('#8dd3c7')
+                node_sizes.append(1200)
+                node_colors.append('#6BCB77')  # Green
         
-        # Draw
-        plt.figure(figsize=(14, 10))
-        nx.draw_networkx(
-            G, pos,
-            with_labels=True,
-            node_size=800,
-            node_color=node_colors,
-            arrows=True,
-            width=edge_widths,
+        # Create figure
+        fig, ax = plt.subplots(figsize=(16, 10))
+        
+        # Draw edges first
+        nx.draw_networkx_edges(
+            G, pos, ax=ax,
             edge_color=edge_colors,
-            font_size=8,
-            font_weight='bold',
-            arrowsize=15
+            width=edge_widths,
+            arrows=True,
+            arrowsize=25,
+            arrowstyle='-|>',
+            connectionstyle='arc3,rad=0.1',
+            alpha=0.8,
+            min_source_margin=25,
+            min_target_margin=25
         )
         
-        plt.title(f'{target_gene} Neighborhood: Gene→TF→Target Routes (post-finetune)', fontsize=14)
+        # Draw nodes
+        nx.draw_networkx_nodes(
+            G, pos, ax=ax,
+            node_size=node_sizes,
+            node_color=node_colors,
+            edgecolors='white',
+            linewidths=2
+        )
+        
+        # Draw labels
+        nx.draw_networkx_labels(
+            G, pos, ax=ax,
+            font_size=11,
+            font_weight='bold',
+            font_color='black'
+        )
+        
+        # Add edge labels showing effect direction
+        edge_labels = {}
+        for u, v, d in G.edges(data=True):
+            w = d.get('weight', 0)
+            if w > 0:
+                edge_labels[(u, v)] = '+'
+            else:
+                edge_labels[(u, v)] = '−'
+        
+        nx.draw_networkx_edge_labels(
+            G, pos, ax=ax,
+            edge_labels=edge_labels,
+            font_size=14,
+            font_weight='bold',
+            font_color='#333333'
+        )
+        
+        # Title
+        ax.set_title(
+            f'{target_gene} Regulatory Neighborhood\nGenes → TFs → Target',
+            fontsize=18,
+            fontweight='bold',
+            pad=20
+        )
         
         # Legend
-        from matplotlib.patches import Patch
-        legend_elements = [
-            Patch(facecolor='#fb8072', label='Target Gene'),
-            Patch(facecolor='#bebada', label='TFs'),
-            Patch(facecolor='#8dd3c7', label='Upstream Genes'),
-        ]
-        plt.legend(handles=legend_elements, loc='upper left')
+        from matplotlib.patches import Patch, FancyArrowPatch
+        from matplotlib.lines import Line2D
         
-        plt.axis('off')
+        legend_elements = [
+            Patch(facecolor='#FF6B6B', edgecolor='white', linewidth=2, label=f'Target: {target_gene}'),
+            Patch(facecolor='#9B8CD9', edgecolor='white', linewidth=2, label='Transcription Factors'),
+            Patch(facecolor='#6BCB77', edgecolor='white', linewidth=2, label='Upstream Genes'),
+            Line2D([0], [0], color='#2ca02c', linewidth=3, label='Activates (+)'),
+            Line2D([0], [0], color='#d62728', linewidth=3, label='Represses (−)'),
+        ]
+        ax.legend(
+            handles=legend_elements,
+            loc='upper left',
+            fontsize=11,
+            framealpha=0.9,
+            edgecolor='gray'
+        )
+        
+        # Add column labels
+        ax.text(0, max(len(gene_nodes)/2 + 0.8, 1.5), 'Upstream\nGenes', 
+                ha='center', va='bottom', fontsize=12, style='italic', color='#666666')
+        ax.text(1.5, max(len(tf_nodes)/2 + 0.8, 1.5), 'Transcription\nFactors', 
+                ha='center', va='bottom', fontsize=12, style='italic', color='#666666')
+        ax.text(3, 1.2, 'Target\nGene', 
+                ha='center', va='bottom', fontsize=12, style='italic', color='#666666')
+        
+        ax.axis('off')
+        ax.set_xlim(-0.8, 4.0)
+        
         plt.tight_layout()
-        plt.savefig(output_dir / f'{target_gene}_neighborhood.png', dpi=300, bbox_inches='tight')
+        plt.savefig(output_dir / f'{target_gene}_neighborhood.png', dpi=300, bbox_inches='tight',
+                    facecolor='white', edgecolor='none')
         plt.close()
         
         print(f"    Saved: {target_gene}_neighborhood.png")
-        print(f"    Graph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+        print(f"    Graph: {len(gene_nodes)} genes → {len(tf_nodes)} TFs → {target_gene}")
         
     except ImportError as e:
         print(f"    Skipping graph visualization (missing dependency: {e})")
