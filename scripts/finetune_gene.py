@@ -1,67 +1,147 @@
 #!/usr/bin/env python3
 """
-Fine-tune GRN Model for Specific Target Gene
-=============================================
-Uses the EXACT same code as train_v5.py but adds extra weight on target gene.
+================================================================================
+BRIDGE 2.0: GENE-SPECIFIC FINE-TUNING
+================================================================================
+
+USES EXACTLY the same architecture as train_v7.py:
+- IntegratedGRNModelV7 with Gene→Gene, Gene→TF, TF→TF, TF→Gene
+- OmniPath integration
+- Cofactor gating
+- Context gating (FiLM)
+- Multi-TF mode
+
+ADDS:
+- Extra loss weight on target gene
+- Freezes TF identity (embeddings, cascade)
+- Only tunes gene-level effects
+
+Usage:
+    python scripts/finetune_gene.py \
+        --gene SSTR2 \
+        --model results/sclc_v7/best_model.pt \
+        --singlecell data/sclc/preprocessed.h5ad \
+        --tf-binding data/tf_binding/ \
+        --omnipath data/omnipath/ \
+        --ppi data/ppi/ \
+        --output results/SSTR2_finetuned/ \
+        --epochs 50
+
+Author: BRIDGE Team
 """
 
-import argparse
+import os
+import sys
 import json
+import argparse
 import pickle
 import shutil
-import sys
 from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
+from scipy import stats as scipy_stats
+import warnings
+warnings.filterwarnings('ignore')
 
-sys.path.insert(0, str(Path(__file__).parent))
+# Add parent dir for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Import EVERYTHING from train_v5 - use exact same code
-from train_v5 import (
-    DeltaGRNModel,
-    DeltaFocusedLoss,
-    VirtualPerturbationDatasetV5,
+# =============================================================================
+# IMPORT EVERYTHING FROM train_v7 - KEEP EXACT SAME CODE
+# =============================================================================
+from scripts.train_v7 import (
+    # Data loading (from train_v6 via train_v7)
     load_singlecell_data,
     load_tf_binding,
     compute_tf_activity_linger,
-    classify_tf_states
+    compute_baseline_metrics,
+    
+    # OmniPath loading
+    load_omnipath,
+    _expand_gene_matrix,
+    _expand_gene_tf_matrix,
+    
+    # Model - THE v7 ARCHITECTURE with Gene→Gene, Gene→TF
+    IntegratedGRNModelV7,
+    
+    # Parent model from v6
+    IntegratedGRNModel,
+    
+    # Dataset
+    MultiTFDataset,
+    
+    # Loss function
+    DeltaFocusedLoss,
+    
+    # Trainer - v7 trainer with prior penalty
+    SignalingGRNTrainer,
+    IntegratedGRNTrainer,
 )
 
 
+# =============================================================================
+# GENE-WEIGHTED LOSS (Extends DeltaFocusedLoss)
+# =============================================================================
+
 class GeneWeightedLoss(DeltaFocusedLoss):
     """
-    EXACT same loss as train_v5, but with extra weight on target gene.
+    EXACT same loss as train_v6/v7, but with extra weight on target gene.
+    
+    This encourages the model to predict the target gene's delta more accurately.
     """
     
-    def __init__(self, target_gene_idx: int, gene_weight: float = 10.0, **kwargs):
+    def __init__(
+        self, 
+        target_gene_idx: int, 
+        gene_weight: float = 10.0,
+        **kwargs
+    ):
         super().__init__(**kwargs)
         self.target_gene_idx = target_gene_idx
         self.gene_weight = gene_weight
         
-    def forward(self, pred_delta, actual_delta, gene_effects=None, batch_chip_mask=None):
-        # Get base loss from parent (EXACT same as train_v5)
-        losses = super().forward(pred_delta, actual_delta, gene_effects, batch_chip_mask)
+    def forward(
+        self, 
+        pred_delta: torch.Tensor, 
+        actual_delta: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute loss with extra weight on target gene.
         
-        # Add extra loss for target gene
+        Args:
+            pred_delta: (batch, n_genes) predicted expression changes
+            actual_delta: (batch, n_genes) actual expression changes
+            
+        Returns:
+            Dict with loss components including target gene metrics
+        """
+        # Get base loss from parent (EXACT same as train_v6/v7)
+        losses = super().forward(pred_delta, actual_delta)
+        
+        # Extract target gene predictions
         target_pred = pred_delta[:, self.target_gene_idx]
         target_actual = actual_delta[:, self.target_gene_idx]
         
-        # Target gene MSE (weighted)
+        # Target gene MSE (weighted extra)
         target_mse = F.mse_loss(target_pred, target_actual)
         
         # Target gene correlation
-        pred_c = target_pred - target_pred.mean()
-        actual_c = target_actual - target_actual.mean()
-        correlation = (pred_c * actual_c).mean() / (pred_c.std() * actual_c.std() + 1e-8)
+        pred_centered = target_pred - target_pred.mean()
+        actual_centered = target_actual - target_actual.mean()
+        
+        numerator = (pred_centered * actual_centered).sum()
+        denominator = (pred_centered.std() * actual_centered.std() * len(target_pred)) + 1e-8
+        correlation = numerator / denominator
         correlation = torch.clamp(correlation, -1, 1)
         
-        # Target gene direction
+        # Target gene direction accuracy
         sign_match = ((target_pred > 0) == (target_actual > 0)).float().mean()
         
         # Add weighted target loss to total
@@ -73,262 +153,551 @@ class GeneWeightedLoss(DeltaFocusedLoss):
         return losses
 
 
+# =============================================================================
+# GENE-SPECIFIC TRAINER (Extends SignalingGRNTrainer from v7)
+# =============================================================================
+
+class GeneSpecificTrainer(SignalingGRNTrainer):
+    """
+    Trainer for gene-specific fine-tuning.
+    
+    INHERITS ALL functionality from SignalingGRNTrainer (train_v7):
+    - train_epoch_multi_tf with prior penalty
+    - validate_multi_tf
+    - compute_prior_penalty
+    
+    ADDS:
+    - Gene-weighted loss
+    - Extra tracking for target gene metrics
+    """
+    
+    def __init__(
+        self,
+        model: IntegratedGRNModelV7,
+        device: torch.device,
+        target_gene_idx: int,
+        gene_weight: float = 10.0,
+        learning_rate: float = 1e-4,
+        use_amp: bool = True,
+        use_chip_reg: bool = True,
+        prior_penalty_weight: float = 0.01
+    ):
+        # Call parent constructor (SignalingGRNTrainer -> IntegratedGRNTrainer)
+        super().__init__(
+            model=model,
+            device=device,
+            learning_rate=learning_rate,
+            use_amp=use_amp,
+            use_chip_reg=use_chip_reg,
+            prior_penalty_weight=prior_penalty_weight
+        )
+        
+        self.target_gene_idx = target_gene_idx
+        self.gene_weight = gene_weight
+        
+        # Replace loss function with gene-weighted version
+        self.loss_fn = GeneWeightedLoss(
+            target_gene_idx=target_gene_idx,
+            gene_weight=gene_weight,
+            use_chip_reg=use_chip_reg
+        )
+    
+    def train_epoch_multi_tf(
+        self,
+        dataloader: DataLoader,
+        epoch: int
+    ) -> Dict[str, float]:
+        """
+        Training epoch for gene-specific fine-tuning.
+        
+        SAME as parent but tracks target gene metrics.
+        """
+        self.model.train()
+        
+        total_loss = 0.0
+        total_mse = 0.0
+        total_prior = 0.0
+        total_target_corr = 0.0
+        total_target_sign = 0.0
+        all_pred_deltas = []
+        all_actual_deltas = []
+        all_target_preds = []
+        all_target_actuals = []
+        
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch:3d}")
+        
+        for batch in pbar:
+            tf_change = batch['tf_activity_change'].to(self.device)
+            source_expr = batch['source_expression'].to(self.device)
+            actual_delta = batch['delta_expression'].to(self.device)
+            
+            self.optimizer.zero_grad()
+            
+            from torch.cuda.amp import autocast
+            with autocast(enabled=self.use_amp):
+                pred_delta, grn_matrix = self.model.predict_delta_multi_tf(
+                    tf_change, source_expr
+                )
+                
+                losses = self.loss_fn(pred_delta, actual_delta)
+                
+                # Add L2 prior penalty (from SignalingGRNTrainer)
+                prior_penalty = self.compute_prior_penalty()
+                total_loss_batch = losses['total'] + prior_penalty
+            
+            if self.use_amp:
+                self.scaler.scale(total_loss_batch).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                total_loss_batch.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+            
+            total_loss += losses['total'].item()
+            total_mse += losses['mse'].item()
+            total_prior += prior_penalty.item()
+            total_target_corr += losses['target_corr'].item()
+            total_target_sign += losses['target_sign'].item()
+            
+            # Collect for metrics
+            if len(all_pred_deltas) < 50:
+                all_pred_deltas.append(pred_delta.detach().cpu())
+                all_actual_deltas.append(actual_delta.detach().cpu())
+            
+            # Always collect target gene for accurate metrics
+            all_target_preds.append(pred_delta[:, self.target_gene_idx].detach().cpu())
+            all_target_actuals.append(actual_delta[:, self.target_gene_idx].detach().cpu())
+            
+            pbar.set_postfix({
+                'loss': f'{losses["total"].item():.4f}',
+                'target_r': f'{losses["target_corr"].item():.3f}',
+                'sign': f'{losses["target_sign"].item():.1%}'
+            })
+        
+        # Compute metrics
+        n_batches = len(dataloader)
+        
+        # Full delta correlation
+        all_pred = torch.cat(all_pred_deltas, dim=0)
+        all_actual = torch.cat(all_actual_deltas, dim=0)
+        delta_pcc = self._batch_correlation(all_pred, all_actual)
+        
+        # Target gene correlation (using ALL batches)
+        all_target_p = torch.cat(all_target_preds)
+        all_target_a = torch.cat(all_target_actuals)
+        target_pcc = scipy_stats.pearsonr(
+            all_target_p.numpy(), 
+            all_target_a.numpy()
+        )[0] if len(all_target_p) > 10 else 0.0
+        
+        return {
+            'loss': total_loss / n_batches,
+            'mse': total_mse / n_batches,
+            'prior_penalty': total_prior / n_batches,
+            'delta_pcc': delta_pcc,
+            'target_pcc': target_pcc,
+            'target_sign': total_target_sign / n_batches
+        }
+    
+    def validate_multi_tf(
+        self,
+        dataloader: DataLoader
+    ) -> Dict[str, float]:
+        """
+        Validation with target gene metrics.
+        """
+        self.model.eval()
+        
+        total_loss = 0.0
+        all_pred_deltas = []
+        all_actual_deltas = []
+        all_target_preds = []
+        all_target_actuals = []
+        
+        with torch.no_grad():
+            pbar = tqdm(dataloader, desc="  [VAL]", leave=True)
+            
+            for batch in pbar:
+                tf_change = batch['tf_activity_change'].to(self.device)
+                source_expr = batch['source_expression'].to(self.device)
+                actual_delta = batch['delta_expression'].to(self.device)
+                
+                from torch.cuda.amp import autocast
+                with autocast(enabled=self.use_amp):
+                    pred_delta, _ = self.model.predict_delta_multi_tf(
+                        tf_change, source_expr
+                    )
+                    losses = self.loss_fn(pred_delta, actual_delta)
+                
+                total_loss += losses['total'].item()
+                all_pred_deltas.append(pred_delta.cpu())
+                all_actual_deltas.append(actual_delta.cpu())
+                all_target_preds.append(pred_delta[:, self.target_gene_idx].cpu())
+                all_target_actuals.append(actual_delta[:, self.target_gene_idx].cpu())
+                
+                pbar.set_postfix({'loss': f'{losses["total"].item():.4f}'})
+        
+        # Compute metrics
+        all_pred = torch.cat(all_pred_deltas, dim=0)
+        all_actual = torch.cat(all_actual_deltas, dim=0)
+        
+        delta_pcc = self._batch_correlation(all_pred, all_actual)
+        dir_acc = self._compute_direction_accuracy(all_pred, all_actual)
+        
+        # Target gene metrics
+        all_target_p = torch.cat(all_target_preds)
+        all_target_a = torch.cat(all_target_actuals)
+        target_pcc = scipy_stats.pearsonr(
+            all_target_p.numpy(),
+            all_target_a.numpy()
+        )[0] if len(all_target_p) > 10 else 0.0
+        
+        target_dir = ((all_target_p > 0) == (all_target_a > 0)).float().mean().item()
+        
+        return {
+            'val_loss': total_loss / len(dataloader),
+            'val_delta_pcc': delta_pcc,
+            'val_dir_acc': dir_acc,
+            'val_target_pcc': target_pcc,
+            'val_target_dir': target_dir
+        }
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--gene', type=str, required=True)
-    parser.add_argument('--model', type=str, required=True)
-    parser.add_argument('--singlecell', type=str, required=True)
-    parser.add_argument('--tf-binding', type=str, required=True)
-    parser.add_argument('--output', type=str, required=True)
+    parser = argparse.ArgumentParser(
+        description='BRIDGE 2.0: Gene-Specific Fine-Tuning (uses train_v7 architecture)'
+    )
+    
+    # Required arguments
+    parser.add_argument('--gene', type=str, required=True,
+                        help='Target gene symbol (e.g., SSTR2)')
+    parser.add_argument('--model', type=str, required=True,
+                        help='Path to trained v7 model checkpoint')
+    parser.add_argument('--singlecell', type=str, required=True,
+                        help='Path to h5ad file')
+    parser.add_argument('--tf-binding', type=str, required=True,
+                        help='TF binding directory')
+    
+    # OmniPath (SAME as train_v7)
+    parser.add_argument('--omnipath', type=str, default=None,
+                        help='OmniPath directory (optional but recommended)')
+    parser.add_argument('--ppi', type=str, default=None,
+                        help='PPI directory')
+    
+    # Output
+    parser.add_argument('--output', type=str, required=True,
+                        help='Output directory')
+    
+    # Training params
     parser.add_argument('--celltype-key', type=str, default='sclc_subcluster')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--gene-weight', type=float, default=5.0)
+    parser.add_argument('--gene-weight', type=float, default=10.0,
+                        help='Extra weight on target gene loss')
+    parser.add_argument('--hidden-dim', type=int, default=512)
+    parser.add_argument('--val-every', type=int, default=1)
+    
+    # OmniPath flags (SAME as train_v7)
+    parser.add_argument('--no-gene-propagation', action='store_true',
+                        help='Disable gene→gene propagation')
+    parser.add_argument('--no-gene-tf-modulation', action='store_true',
+                        help='Disable gene→TF modulation')
+    
     args = parser.parse_args()
     
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     target_gene = args.gene.upper()
     
     print("=" * 70)
-    print(f"FINE-TUNING FOR {target_gene}")
+    print(f"BRIDGE 2.0: GENE-SPECIFIC FINE-TUNING FOR {target_gene}")
+    print("(Uses EXACT same architecture as train_v7)")
     print("=" * 70)
     print(f"Device: {device}")
     print(f"Gene weight: {args.gene_weight}x")
     
     # =========================================================================
-    # Load Data (SAME as train_v5)
+    # [1/7] Load Single-Cell Data (SAME AS train_v7)
     # =========================================================================
-    print("\n[1/5] Loading single-cell data...")
-    expression, gene_names, celltypes = load_singlecell_data(args.singlecell, args.celltype_key)
+    print("\n[1/7] Loading single-cell data...")
+    expression, gene_names, celltypes = load_singlecell_data(
+        args.singlecell, args.celltype_key
+    )
     n_celltypes, n_genes = expression.shape
+    print(f"  Expression: {expression.shape}")
     
     # Find target gene
     gene_names_upper = [g.upper() for g in gene_names]
     if target_gene not in gene_names_upper:
+        print(f"  Available genes containing '{target_gene[:4]}': ", end="")
+        matches = [g for g in gene_names if target_gene[:4].upper() in g.upper()]
+        print(matches[:10])
         raise ValueError(f"Target gene {target_gene} not found!")
+    
     target_gene_idx = gene_names_upper.index(target_gene)
     print(f"  Target gene: {target_gene} at index {target_gene_idx}")
     print(f"  Expression range: [{expression[:, target_gene_idx].min():.3f}, {expression[:, target_gene_idx].max():.3f}]")
     
-    print("\n[2/5] Loading TF binding...")
+    # =========================================================================
+    # [2/7] Load TF Binding (SAME AS train_v7)
+    # =========================================================================
+    print("\n[2/7] Loading TF binding data...")
     binding_matrix, tf_names, tf_tf_adj = load_tf_binding(args.tf_binding, gene_names)
     n_tfs = len(tf_names)
+    print(f"  Aligned {binding_matrix.shape[0]}/{n_genes} genes")
     print(f"  TFs: {n_tfs}")
+    print(f"  Binding: {binding_matrix.shape}")
     
-    print("\n[3/5] Computing TF activity...")
+    # =========================================================================
+    # [3/7] Compute TF Activity (SAME AS train_v7)
+    # =========================================================================
+    print("\n[3/7] Computing TF activity...")
     tf_activity = compute_tf_activity_linger(expression, binding_matrix)
-    tf_states = classify_tf_states(tf_activity)
     print(f"  TF activity: {tf_activity.shape}")
     
     # =========================================================================
-    # Load Pre-trained Model
+    # [4/7] Load OmniPath (SAME AS train_v7)
     # =========================================================================
-    print("\n[4/5] Loading pre-trained model...")
+    print("\n[4/7] Loading OmniPath signaling network...")
+    if args.omnipath:
+        gene_gene, gene_tf, tf_tf_omnipath = load_omnipath(
+            args.omnipath, len(gene_names), len(tf_names),
+            gene_names=gene_names, tf_names=tf_names
+        )
+        # Blend TF-TF from ChIP and OmniPath
+        if tf_tf_omnipath is not None:
+            tf_tf_combined = tf_tf_adj + 0.3 * tf_tf_omnipath
+        else:
+            tf_tf_combined = tf_tf_adj
+        has_omnipath = True
+    else:
+        gene_gene = np.zeros((len(gene_names), len(gene_names)), dtype=np.float32)
+        gene_tf = np.zeros((len(gene_names), len(tf_names)), dtype=np.float32)
+        tf_tf_combined = tf_tf_adj
+        has_omnipath = False
+        print("  No OmniPath data provided")
+    
+    # =========================================================================
+    # [5/7] Create Datasets (SAME AS train_v7)
+    # =========================================================================
+    print("\n[5/7] Creating datasets...")
+    
+    # Cell-type pair split (hold out some for validation)
+    n_holdout = max(2, n_celltypes // 6)
+    np.random.seed(42)
+    holdout = set(np.random.choice(n_celltypes, n_holdout, replace=False))
+    train_idx = [i for i in range(n_celltypes) if i not in holdout]
+    
+    train_pairs = [(i, j) for i in train_idx for j in train_idx if i != j]
+    val_pairs = [(i, j) for i in holdout for j in holdout if i != j]
+    
+    print(f"  Train cell-type pairs: {len(train_pairs)}")
+    print(f"  Val cell-type pairs: {len(val_pairs)}")
+    
+    train_dataset = MultiTFDataset(
+        expression_means=expression,
+        tf_activity=tf_activity,
+        celltype_names=list(celltypes),
+        allowed_pairs=train_pairs
+    )
+    val_dataset = MultiTFDataset(
+        expression_means=expression,
+        tf_activity=tf_activity,
+        celltype_names=list(celltypes),
+        allowed_pairs=val_pairs
+    )
+    
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        drop_last=len(train_dataset) > args.batch_size
+    )
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    
+    print(f"  Train samples: {len(train_dataset)}")
+    print(f"  Val samples: {len(val_dataset)}")
+    
+    # =========================================================================
+    # [6/7] Load Pre-trained Model (SAME ARCHITECTURE AS train_v7)
+    # =========================================================================
+    print("\n[6/7] Loading pre-trained model...")
     model_path = Path(args.model)
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
     
     if 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']
         loaded_epoch = checkpoint.get('epoch', 'unknown')
-        loaded_delta = checkpoint.get('best_val_delta_pcc', checkpoint.get('val_delta_pcc', 'unknown'))
+        loaded_delta = checkpoint.get('best_val_delta_pcc', 'unknown')
         print(f"  Loaded checkpoint: epoch={loaded_epoch}, delta_pcc={loaded_delta}")
     else:
         state_dict = checkpoint
         print("  Loaded raw state dict")
     
-    # Create model (SAME architecture as train_v5)
-    model = DeltaGRNModel(
+    # Create model (EXACT SAME as train_v7)
+    model = IntegratedGRNModelV7(
         n_genes=n_genes,
         n_tfs=n_tfs,
-        hidden_dim=256,
-        n_cascade_layers=2,
-        dropout=0.2,
-        use_context_gating=True
+        hidden_dim=args.hidden_dim,
+        use_gene_propagation=has_omnipath and not args.no_gene_propagation,
+        use_gene_tf_modulation=has_omnipath and not args.no_gene_tf_modulation
     )
     
-    # Set priors BEFORE loading weights
+    # Load PPI cofactor data (SAME as train_v7)
+    cof_to_tf = None
+    cof_indices = None
+    if args.ppi:
+        ppi_dir = Path(args.ppi)
+        if (ppi_dir / 'cof_to_tf_adj.npy').exists():
+            cof_to_tf = np.load(ppi_dir / 'cof_to_tf_adj.npy')
+            cof_indices = np.load(ppi_dir / 'cofactor_gene_indices.npy')
+    
+    # Set all priors (SAME as train_v7)
     model.set_priors(
-        chip_binding=torch.FloatTensor(binding_matrix),
-        tf_tf_adjacency=torch.FloatTensor(tf_tf_adj)
+        chip_binding=torch.from_numpy(binding_matrix),
+        tf_tf_adjacency=torch.from_numpy(tf_tf_combined),
+        cofactor_tf_adjacency=torch.from_numpy(cof_to_tf) if cof_to_tf is not None else None,
+        cofactor_gene_indices=torch.from_numpy(cof_indices) if cof_indices is not None else None
     )
     
-    # Load weights
+    # Set OmniPath priors (SAME as train_v7)
+    if has_omnipath:
+        model.set_omnipath_priors(
+            gene_gene=torch.from_numpy(gene_gene),
+            gene_tf=torch.from_numpy(gene_tf)
+        )
+    
+    # Load pre-trained weights
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
-        print(f"  Warning: missing keys: {missing[:5]}...")
+        print(f"  Missing keys: {len(missing)} (expected for new components)")
     if unexpected:
-        print(f"  Warning: unexpected keys: {unexpected[:5]}...")
+        print(f"  Unexpected keys: {len(unexpected)}")
     
-    model.to(device)
-    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # =========================================================================
-    # Create Dataset (SAME as train_v5)
-    # =========================================================================
-    print("\n[5/5] Creating training data...")
-    
-    # All pairs for fine-tuning
-    pairs = [(i, j) for i in range(n_celltypes) for j in range(n_celltypes) if i != j]
-    print(f"  Training pairs: {len(pairs)}")
-    
-    dataset = VirtualPerturbationDatasetV5(
-        expression_means=expression,
-        tf_activity=tf_activity,
-        celltype_names=celltypes,
-        allowed_pairs=pairs,
-        min_activity_diff=0.1,
-        add_hard_negatives=True
-    )
-    
-    print(f"  Samples: {len(dataset)}")
-    
-    # Use weighted sampler (SAME as train_v5)
-    sampler = WeightedRandomSampler(
-        weights=dataset.sample_weights,
-        num_samples=min(len(dataset), 100000),  # Cap for speed
-        replacement=True
-    )
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        num_workers=0,
-        pin_memory=True
-    )
-    
-    print(f"  Batches per epoch: {len(dataloader)}")
+    model = model.to(device)
+    print(f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # =========================================================================
-    # Fine-tuning Setup
+    # FREEZE TF IDENTITY, ONLY TUNE GENE-LEVEL EFFECTS
     # =========================================================================
-    # Loss: SAME as train_v5 + extra weight on target gene
-    loss_fn = GeneWeightedLoss(
-        target_gene_idx=target_gene_idx,
-        gene_weight=args.gene_weight,
-        delta_weight=1.0,
-        ranking_weight=0.3,
-        direction_weight=0.5,
-        chip_reg_weight=0.2
-    )
+    print("\n  Configuring fine-tuning...")
     
-    # Only fine-tune effect-related layers
-    # CRITICAL: Freeze tf_embeddings and tf_cascade to preserve TF identity!
-    # Only allow changing how TFs map to genes (decoder) and the specific gene wiring (direct)
+    # Freeze TF-level components (preserve learned TF relationships)
     finetune_params = []
     frozen_count = 0
+    trainable_count = 0
+    
     for name, param in model.named_parameters():
-        # FREEZE: TF embeddings and cascade - these define TF identity and relationships
-        if 'tf_embeddings' in name or 'tf_cascade' in name:
+        # FREEZE: TF embeddings, cascade, and gene propagation/modulation
+        # These represent learned TF relationships we want to preserve
+        if any(x in name for x in [
+            'tf_embeddings', 'tf_cascade',
+            'gene_propagation', 'gene_to_tf', 'gene_prop_weight',
+            'gene_tf_modulation_strength'
+        ]):
             param.requires_grad = False
             frozen_count += 1
-        # FINE-TUNE: Effect decoder (TF->gene mapping), direct effects, context gating
-        elif any(x in name for x in ['effect_decoder', 'direct_effects', 'context']):
+        # FINE-TUNE: Effect decoder (TF→gene), direct effects, context gating
+        elif any(x in name for x in [
+            'effect_decoder', 'direct_effects', 'context',
+            'chip_mask', '_leakage_raw'
+        ]):
             param.requires_grad = True
             finetune_params.append(param)
+            trainable_count += 1
         else:
             param.requires_grad = False
             frozen_count += 1
     
-    print(f"  Fine-tuning: {len(finetune_params)} groups, {sum(p.numel() for p in finetune_params):,} params")
+    print(f"  Fine-tuning: {trainable_count} groups, {sum(p.numel() for p in finetune_params):,} params")
     print(f"  Frozen: {frozen_count} groups")
     
-    optimizer = torch.optim.AdamW(finetune_params, lr=args.lr, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
+    # =========================================================================
+    # [7/7] Create Trainer and Train
+    # =========================================================================
+    print("\n[7/7] Setting up training...")
+    
+    trainer = GeneSpecificTrainer(
+        model=model,
+        device=device,
+        target_gene_idx=target_gene_idx,
+        gene_weight=args.gene_weight,
+        learning_rate=args.lr,
+        use_amp=True,
+        prior_penalty_weight=0.01
+    )
+    
+    # Replace optimizer with one that only updates finetune_params
+    trainer.optimizer = torch.optim.AdamW(finetune_params, lr=args.lr, weight_decay=0.01)
+    
+    print(f"  Gene propagation: {'ON' if model.use_gene_propagation else 'OFF'}")
+    print(f"  Gene→TF modulation: {'ON' if model.use_gene_tf_modulation else 'OFF'}")
     
     # =========================================================================
-    # Training Loop
+    # TRAINING LOOP
     # =========================================================================
     print("\n" + "=" * 70)
-    print("FINE-TUNING")
+    print(f"FINE-TUNING FOR {target_gene}")
     print("=" * 70)
     
-    best_corr = -1.0
+    best_target_pcc = -1.0
     best_epoch = 0
     history = []
     
     for epoch in range(1, args.epochs + 1):
-        model.train()
+        # Train
+        train_metrics = trainer.train_epoch_multi_tf(train_loader, epoch)
         
-        epoch_loss = []
-        epoch_delta_mse = []
-        epoch_target_corr = []
-        epoch_target_sign = []
+        print(f"Epoch {epoch:3d}: loss={train_metrics['loss']:.4f} "
+              f"| {target_gene}_r={train_metrics['target_pcc']:.4f} "
+              f"| sign={train_metrics['target_sign']:.1%}")
         
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch:3d}", leave=True)
-        
-        for batch in pbar:
-            source = batch['source_expression'].to(device)
-            tf_idx = batch['tf_idx'].to(device)
-            pert_type = batch['perturbation_type'].to(device)
-            pert_strength = batch['perturbation_strength'].to(device)
-            actual_delta = batch['delta_expression'].to(device)
+        # Validate
+        if epoch % args.val_every == 0:
+            val_metrics = trainer.validate_multi_tf(val_loader)
             
-            optimizer.zero_grad()
+            print(f"  [VAL] Delta_PCC={val_metrics['val_delta_pcc']:.4f} "
+                  f"| {target_gene}_r={val_metrics['val_target_pcc']:.4f} "
+                  f"| Dir={val_metrics['val_target_dir']:.1%}")
             
-            # Forward (SAME as train_v5)
-            outputs = model(source, tf_idx, pert_type, pert_strength)
+            # Save best based on target gene PCC
+            if val_metrics['val_target_pcc'] > best_target_pcc:
+                best_target_pcc = val_metrics['val_target_pcc']
+                best_epoch = epoch
+                
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'target_gene': target_gene,
+                    'target_gene_idx': target_gene_idx,
+                    'best_target_pcc': best_target_pcc,
+                    'val_delta_pcc': val_metrics['val_delta_pcc'],
+                    'config': model.config
+                }, output_dir / 'best_model.pt')
+                
+                print(f"  >> New best! {target_gene}_PCC={best_target_pcc:.4f}")
             
-            # Loss (SAME as train_v5 + target weight)
-            losses = loss_fn(
-                pred_delta=outputs['delta_expression'],
-                actual_delta=actual_delta,
-                gene_effects=outputs['gene_effects'],
-                batch_chip_mask=outputs['batch_chip_mask']
-            )
-            
-            losses['total'].backward()
-            torch.nn.utils.clip_grad_norm_(finetune_params, 1.0)
-            optimizer.step()
-            
-            # Track
-            epoch_loss.append(losses['total'].item())
-            epoch_delta_mse.append(losses['delta_mse'].item())
-            epoch_target_corr.append(losses['target_corr'].item())
-            epoch_target_sign.append(losses['target_sign'].item())
-            
-            # Show running averages
-            pbar.set_postfix({
-                'loss': f"{np.mean(epoch_loss):.2f}",
-                'delta': f"{np.mean(epoch_delta_mse):.2f}",
-                f'{target_gene}_r': f"{np.mean(epoch_target_corr):.3f}",
-                'sign': f"{np.mean(epoch_target_sign):.1%}"
-            })
-        
-        scheduler.step()
-        
-        # Epoch summary
-        avg_loss = np.mean(epoch_loss)
-        avg_corr = np.mean(epoch_target_corr)
-        avg_sign = np.mean(epoch_target_sign)
-        
-        print(f"Epoch {epoch:3d}: loss={avg_loss:.2f} | {target_gene}_corr={avg_corr:.4f} | sign={avg_sign:.1%}")
-        
-        history.append({
-            'epoch': epoch,
-            'loss': avg_loss,
-            'target_corr': avg_corr,
-            'target_sign': avg_sign
-        })
-        
-        # Save best
-        if avg_corr > best_corr:
-            best_corr = avg_corr
-            best_epoch = epoch
-            torch.save({
+            # Record history
+            history.append({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'target_gene': target_gene,
-                'target_gene_idx': target_gene_idx,
-                'best_correlation': best_corr,
-            }, output_dir / 'best_model.pt')
-            print(f"  >> New best! {target_gene}_corr={best_corr:.4f}")
+                'train_loss': train_metrics['loss'],
+                'train_target_pcc': train_metrics['target_pcc'],
+                'train_target_sign': train_metrics['target_sign'],
+                'val_delta_pcc': val_metrics['val_delta_pcc'],
+                'val_target_pcc': val_metrics['val_target_pcc'],
+                'val_target_dir': val_metrics['val_target_dir']
+            })
     
     # =========================================================================
-    # Save Results
+    # SAVE RESULTS
     # =========================================================================
     print("\n" + "=" * 70)
     print("SAVING RESULTS")
@@ -337,14 +706,28 @@ def main():
     # Save GRN matrix
     grn_matrix = model.get_grn_matrix().detach().cpu().numpy()
     np.save(output_dir / 'grn_matrix.npy', grn_matrix)
+    print(f"  Saved: grn_matrix.npy {grn_matrix.shape}")
     
-    # Copy metadata from original model
-    model_dir = model_path.parent
-    for fname in ['gene_names.csv', 'tf_names.csv', 'celltype_names.csv', 
-                  'binding_matrix.npy', 'tf_activity.npy', 'tf_states.npy']:
-        src = model_dir / fname
-        if src.exists():
-            shutil.copy(src, output_dir / fname)
+    # Save signaling networks (v7 specific)
+    if hasattr(model, 'get_signaling_networks'):
+        networks = model.get_signaling_networks()
+        for name, net in networks.items():
+            if net is not None:
+                np.save(output_dir / f'{name}.npy', net.cpu().numpy())
+                print(f"  Saved: {name}.npy")
+    
+    # Save metadata
+    pd.DataFrame({'gene': gene_names}).to_csv(
+        output_dir / 'gene_names.csv', index=False, header=False
+    )
+    pd.DataFrame({'tf': tf_names}).to_csv(
+        output_dir / 'tf_names.csv', index=False, header=False
+    )
+    pd.DataFrame({'celltype': celltypes}).to_csv(
+        output_dir / 'celltype_names.csv', index=False, header=False
+    )
+    np.save(output_dir / 'tf_activity.npy', tf_activity)
+    np.save(output_dir / 'binding_matrix.npy', binding_matrix)
     
     # Save history
     pd.DataFrame(history).to_csv(output_dir / 'finetune_history.csv', index=False)
@@ -356,16 +739,21 @@ def main():
         'gene_weight': args.gene_weight,
         'epochs': args.epochs,
         'best_epoch': best_epoch,
-        'best_correlation': float(best_corr),
+        'best_target_pcc': float(best_target_pcc),
         'n_genes': n_genes,
-        'n_tfs': n_tfs
+        'n_tfs': n_tfs,
+        'has_omnipath': has_omnipath,
+        'model_version': 'v7'
     }
     with open(output_dir / 'finetune_config.json', 'w') as f:
         json.dump(config, f, indent=2)
     
-    print(f"\nBest: Epoch {best_epoch} with {target_gene}_corr={best_corr:.4f}")
+    print(f"\nBest: Epoch {best_epoch} with {target_gene}_PCC={best_target_pcc:.4f}")
     print(f"Saved to: {output_dir}")
     
+    # =========================================================================
+    # DONE
+    # =========================================================================
     print("\n" + "=" * 70)
     print("FINE-TUNING COMPLETE!")
     print("=" * 70)
@@ -374,7 +762,8 @@ def main():
     print(f"    --gene {target_gene} \\")
     print(f"    --model {output_dir} \\")
     print(f"    --singlecell {args.singlecell} \\")
-    print(f"    --ppi data/ppi \\")
+    print(f"    --ppi {args.ppi if args.ppi else 'data/ppi'} \\")
+    print(f"    --celltype-key {args.celltype_key} \\")
     print(f"    --output analysis/{target_gene}_finetuned/")
 
 
