@@ -617,11 +617,15 @@ class SignalingGRNTrainer(IntegratedGRNTrainer):
         
         delta_pcc = self._batch_correlation(all_pred, all_actual)
         
+        # Compute direction accuracy (fix for dir=0.000 logging bug)
+        dir_acc = self._compute_direction_accuracy(all_pred, all_actual)
+        
         return {
             'loss': total_loss / n_batches,
             'mse': total_mse / n_batches,
             'prior_penalty': total_prior / n_batches,
-            'delta_pcc': delta_pcc
+            'delta_pcc': delta_pcc,
+            'dir_acc': dir_acc
         }
 
 
@@ -644,6 +648,8 @@ def main():
     parser.add_argument('--val-every', type=int, default=5)
     parser.add_argument('--no-gene-propagation', action='store_true', help='Disable gene→gene propagation')
     parser.add_argument('--no-gene-tf-modulation', action='store_true', help='Disable gene→TF modulation')
+    parser.add_argument('--resume', type=str, default=None, 
+                        help='Path to checkpoint to resume from (e.g., results/sclc_v7/best_model.pt)')
     
     args = parser.parse_args()
     
@@ -778,6 +784,31 @@ def main():
     print(f"  Gene propagation: {'ON' if model.use_gene_propagation else 'OFF'}")
     print(f"  Gene→TF modulation: {'ON' if model.use_gene_tf_modulation else 'OFF'}")
     
+    # =========================================================================
+    # Resume from checkpoint if requested
+    # =========================================================================
+    start_epoch = 1
+    best_delta_pcc = -1
+    best_epoch = 0
+    
+    if args.resume:
+        resume_path = Path(args.resume)
+        if resume_path.exists():
+            print(f"\n  Loading checkpoint from {resume_path}...")
+            checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+            
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                start_epoch = checkpoint.get('epoch', 0) + 1
+                best_delta_pcc = checkpoint.get('delta_pcc', checkpoint.get('best_val_delta_pcc', -1))
+                best_epoch = checkpoint.get('epoch', 0)
+                print(f"  Resumed from epoch {start_epoch-1}, best Delta_PCC={best_delta_pcc:.4f}")
+            else:
+                model.load_state_dict(checkpoint)
+                print(f"  Loaded model weights (raw state dict)")
+        else:
+            print(f"  Warning: Resume checkpoint not found: {resume_path}")
+    
     # Save metadata
     pd.DataFrame({'gene': gene_names}).to_csv(output_dir / 'gene_names.csv', index=False, header=False)
     pd.DataFrame({'tf': tf_names}).to_csv(output_dir / 'tf_names.csv', index=False, header=False)
@@ -798,10 +829,9 @@ def main():
     
     trainer = SignalingGRNTrainer(model, device, learning_rate=args.lr)
     
-    best_delta_pcc = -1
-    best_epoch = 0
+    # Note: best_delta_pcc and best_epoch already set above (may be from resume)
     
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         # Use train_epoch_multi_tf from parent class (IntegratedGRNTrainer)
         train_metrics = trainer.train_epoch_multi_tf(train_loader, epoch)
         
