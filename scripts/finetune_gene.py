@@ -109,20 +109,26 @@ class GeneWeightedLoss(DeltaFocusedLoss):
     def forward(
         self, 
         pred_delta: torch.Tensor, 
-        actual_delta: torch.Tensor
+        actual_delta: torch.Tensor,
+        gene_effects: Optional[torch.Tensor] = None,
+        chip_mask: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Compute loss with extra weight on target gene.
         
+        Signature matches parent DeltaFocusedLoss.forward() for compatibility.
+        
         Args:
             pred_delta: (batch, n_genes) predicted expression changes
             actual_delta: (batch, n_genes) actual expression changes
+            gene_effects: Optional gene effects for ChIP regularization
+            chip_mask: Optional ChIP mask for regularization
             
         Returns:
             Dict with loss components including target gene metrics
         """
         # Get base loss from parent (EXACT same as train_v6/v7)
-        losses = super().forward(pred_delta, actual_delta)
+        losses = super().forward(pred_delta, actual_delta, gene_effects, chip_mask)
         
         # Extract target gene predictions
         target_pred = pred_delta[:, self.target_gene_idx]
@@ -813,6 +819,21 @@ def main():
     
     model = model.to(device)
     print(f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # =========================================================================
+    # GRADIENT MASKING: Only update target gene's direct_effects row
+    # =========================================================================
+    # This prevents global drift in direct_effects - we only want to adjust
+    # how TFs affect the TARGET gene, not all genes
+    if hasattr(model, 'direct_effects'):
+        def mask_direct_effects_grad(grad):
+            """Zero out gradients for all genes except target."""
+            mask = torch.zeros_like(grad)
+            mask[target_gene_idx, :] = 1.0
+            return grad * mask
+        
+        model.direct_effects.register_hook(mask_direct_effects_grad)
+        print(f"  [Gradient Mask] Only updating direct_effects row for {target_gene}")
     
     # =========================================================================
     # FREEZE TF IDENTITY, ONLY TUNE GENE-LEVEL EFFECTS
