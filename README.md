@@ -1,698 +1,466 @@
-# BRIDGE: Complete Molecular Signaling Network Inference
+# BRIDGE 2.0: Complete Molecular Signaling Network Inference
 
 **B**iological **R**egulatory **I**nference via **D**eep **G**raph **E**ncoding
-
----
-
-# SingleCell-GRN: Nature-Level Gene Regulatory Network Inference
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A deep learning framework for inferring gene regulatory networks (GRN) from single-cell RNA-seq data, integrating **ChIP-seq** (TF→Gene binding), **JASPAR** (TF DNA motif specificity), and **Rosetta PPI** (protein-protein interactions).
+A deep learning framework for inferring gene regulatory networks (GRN) from single-cell RNA-seq data, integrating **ChIP-seq** (TF→Gene binding), **JASPAR** (TF DNA motif specificity), **Rosetta PPI** (protein-protein interactions), and **OmniPath** (full molecular signaling network).
 
-## Key Innovation: Virtual CRISPRa/CRISPRi
+---
 
-Instead of requiring expensive CRISPR experiments, we treat **cell-type differences as natural perturbation experiments**:
-
-```
-Cell Type A: TF_X ACTIVE   →  Gene_Y HIGH
-Cell Type B: TF_X INACTIVE →  Gene_Y LOW
-                    ↓
-Conclusion: TF_X likely ACTIVATES Gene_Y!
-```
-
-This provides **thousands of virtual perturbation samples** from observational scRNA-seq data.
-
-## Performance
+## 🎯 Performance (Nature-Level Metrics)
 
 | Metric | Value | Description |
 |--------|-------|-------------|
-| **Delta_PCC** | 0.984 | Correlation of predicted vs actual expression CHANGES |
-| **Direction_Acc** | 99.4% | Accuracy of up/down regulation prediction |
-| **Fine-tune r** | 0.984 | Gene-specific prediction correlation (SSTR2 example) |
-| **Fine-tune R²** | 0.968 | Variance explained for target gene |
-
-## Features 🆕
-
-| Feature | Description |
-|---------|-------------|
-| **Figure 4: TF Generalizability** | Identifies TFs with consistent effects across ALL cell types |
-| **Multi-Gene Mode** | Fine-tune for multiple genes → find **Master Regulators** |
-| **Master Regulator Discovery** | Rank TFs by their effect on entire gene signatures |
-| **UMAP Visualization** | Cell-type embeddings colored by TF effects |
-| **🆕 Hypothesis Builder GUI** | Interactive pathway builder to test regulatory hypotheses |
-| **🆕 Hypothesis Testing** | Validate your TF→Gene pathway hypotheses against the GRN |
-
-## Quick Reference: Three Modes
-
-| Mode | Command | Purpose | Training? |
-|------|---------|---------|-----------|
-| **Single Gene** | `--gene SSTR2` | Best predictions for one gene | ✅ Yes |
-| **Multi-Gene** | `--gene genes.txt` | Find master regulators | ✅ Yes |
-| **Hypothesis** | `--hypothesis path.txt` | Validate your pathway | ❌ No |
-
-```bash
-# 1️⃣ Single gene fine-tuning (TRAINS the model for your gene)
-python scripts/finetune_gene.py --gene SSTR2 --model results/sclc/ ...
-
-# 2️⃣ Multi-gene / Master regulators (TRAINS for multiple genes)
-python scripts/finetune_gene.py --gene genes.txt --model results/sclc/ ...
-
-# 3️⃣ Hypothesis testing (NO training - just validates against learned GRN)
-python scripts/finetune_gene.py --hypothesis pathway.txt --model results/sclc/ ...
-
-# 🎨 Launch interactive hypothesis builder GUI
-python scripts/hypothesis_builder.py
-```
+| **Per-Gene ΔPCC** | 0.579 (median) | Correlation of predicted vs actual CHANGES |
+| **AUROC** | 0.934-0.951 | Up/down regulation classification |
+| **AUPRC** | 0.923-0.940 | Precision-recall for direction |
+| **R² on deltas** | 0.578 | Variance explained |
+| **Direction Accuracy** | 88-91% | Correct up/down predictions |
+| **NDCG@100** | 0.892 | Ranking quality |
+| **Gene-specific (SSTR2)** | 0.808 | After fine-tuning |
 
 ---
 
-## When to Use Each Mode
+## 📋 Table of Contents
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  DECISION TREE: Which mode should I use?                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  "I want to PREDICT gene expression"                                    │
-│       │                                                                  │
-│       ├── For ONE gene → --gene SSTR2 (Single Gene Fine-tune)           │
-│       │                                                                  │
-│       └── For MULTIPLE genes → --gene genes.txt (Master Regulators)     │
-│                                                                          │
-│  "I have a HYPOTHESIS to test"                                          │
-│       │                                                                  │
-│       └── --hypothesis pathway.txt (Validation only, NO training)       │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Why This Matters:
-
-| Goal | Mode | Reason |
-|------|------|--------|
-| Find TFs that regulate SSTR2 | `--gene SSTR2` | Fine-tune focuses model on your gene |
-| Find pan-NE master regulators | `--gene NE_markers.txt` | Identifies TFs affecting ALL genes |
-| Test "ASCL1 → SSTR2" | `--hypothesis` | Unbiased check against learned GRN |
+1. [Quick Start](#-quick-start)
+2. [Installation](#-installation)
+3. [Data Preparation](#-data-preparation)
+4. [Step-by-Step Workflow](#-step-by-step-workflow)
+5. [Script Reference](#-script-reference)
+6. [Output Interpretation](#-output-interpretation)
+7. [Nature-Level Evaluation](#-nature-level-evaluation)
+8. [Troubleshooting](#-troubleshooting)
 
 ---
 
-## Hypothesis Pathway Builder 🧬
-
-A beautiful interactive GUI to build and test regulatory hypotheses.
-
-### Launching the GUI
+## 🚀 Quick Start
 
 ```bash
-# Option 1: Direct launch
-python scripts/hypothesis_builder.py
-
-# Option 2: With predefined structure
-python scripts/hypothesis_builder.py --tfs 3 --genes 2
-
-# Option 3: Via finetune script
-python scripts/finetune_gene.py --hypothesis gui \
-    --model results/sclc/ \
-    --singlecell data/sclc/preprocessed.h5ad \
-    --tf-binding data/tf_binding/ \
-    --output results/hypothesis/
-```
-
-### GUI Features
-
-| Feature | How To | Description |
-|---------|--------|-------------|
-| **Add TF** | Click "➕ Add TF" or toolbar | Creates a blue square (■) |
-| **Add Gene** | Click "➕ Add Gene" or toolbar | Creates a pink circle (●) |
-| **Rename** | Double-click node | Enter real gene symbol |
-| **Move** | Drag node | Reposition on canvas |
-| **Activator** | Press `A`, click source, click target | Green arrow (→) |
-| **Repressor** | Press `R`, click source, click target | Red bar (⊣) |
-| **Delete** | Right-click → Delete | Remove node or connection |
-| **Set Output** | Right-click → Set as Output | Mark as prediction target (gold) |
-| **Save** | File → Save | JSON format for later editing |
-| **Export** | Click "🧪 Test Hypothesis" | TXT format for testing |
-
-### Keyboard Shortcuts
-
-| Key | Action |
-|-----|--------|
-| `A` | Activator mode |
-| `R` | Repressor mode |
-| `Esc` | Select mode (exit connection mode) |
-| `Delete` | Delete selected node |
-| `Ctrl+S` | Save hypothesis |
-| `Ctrl+O` | Open hypothesis |
-| `Ctrl+N` | New hypothesis |
-
-### Visual Legend
-
-```
-■ Blue Square = Transcription Factor (TF)
-● Pink Circle = Gene
-● Gold Circle = Output Gene (prediction target)
-
-→ Green Arrow = Activator (TF increases gene expression)
-⊣ Red Bar     = Repressor (TF decreases gene expression)
-```
-
----
-
-## Hypothesis File Format
-
-After exporting from the GUI (or creating manually):
-
-```bash
-# hypothesis.txt
-# Format: SOURCE -> TARGET (activator) or SOURCE -| TARGET (repressor)
-
-# NODES (for reference)
-# TF: ASCL1
-# TF: REST
-# TF: YAP1
-# GENE: SSTR2 [OUTPUT]
-# GENE: CHGB [OUTPUT]
-
-# CONNECTIONS
-ASCL1 -> SSTR2      # ASCL1 activates SSTR2
-REST -| SSTR2       # REST represses SSTR2
-YAP1 -> ASCL1       # YAP1 activates ASCL1
-YAP1 -| REST        # YAP1 represses REST
-ASCL1 -> YAP1       # Bidirectional loop
-
-# OUTPUT GENES (what you're predicting)
-OUTPUT: SSTR2
-OUTPUT: CHGB
-```
-
-### Syntax Rules:
-- `->` = Activator (TF increases target expression)
-- `-|` = Repressor (TF decreases target expression)
-- Lines starting with `#` are comments
-- `OUTPUT:` declares prediction targets (optional)
-
----
-
-## Testing Your Hypothesis
-
-### Run the Test
-
-```bash
-python scripts/finetune_gene.py \
-    --hypothesis hypothesis.txt \
-    --model results/sclc/ \
-    --singlecell data/sclc/preprocessed.h5ad \
-    --tf-binding data/tf_binding/ \
-    --ppi data/ppi/ \
-    --output results/hypothesis_test/
-```
-
-**Note:** `--gene` is NOT required when `--hypothesis` is provided!
-
-### Output Files
-
-```
-results/hypothesis_test/
-├── hypothesis_results.csv    # Edge-by-edge analysis
-└── hypothesis_test.png       # 4-panel visualization
-```
-
-### Interpreting Results
-
-```
-============================================================
-HYPOTHESIS TEST RESULTS
-============================================================
-
-Overall: 5/7 edges SUPPORTED (71.4%)
-
-Edge-by-Edge Analysis:
-------------------------------------------------------------
-  ASCL1 → SSTR2
-    Effect: +0.1234 (percentile: 89.2%)
-    ✓ SUPPORTED
-
-  REST ⊣ SSTR2
-    Effect: -0.0891 (percentile: 76.4%)
-    ✓ SUPPORTED
-
-  YAP1 → SSTR2
-    Effect: -0.0567 (percentile: 55.1%)
-    ✗ NOT SUPPORTED  ← Data suggests YAP1 REPRESSES, not activates!
-```
-
-### Result Interpretation
-
-| Symbol | Meaning | What It Means |
-|--------|---------|---------------|
-| ✓ SUPPORTED | GRN agrees with your hypothesis | Data supports this relationship |
-| ✗ NOT SUPPORTED | GRN contradicts your hypothesis | Data suggests opposite effect |
-| ⚠ Could not find | Node not in GRN | Gene isn't a TF, or not in dataset |
-| Percentile | Effect strength rank | Higher = stronger, more reliable |
-
-### What "NOT SUPPORTED" Means
-
-**Does NOT mean you're wrong!** It means:
-1. In THIS dataset, the relationship appears different
-2. Could be context-dependent (tissue/disease-specific)
-3. Could be indirect effects (TF→X→Gene instead of TF→Gene)
-4. Could reflect regulatory complexity (activator in some contexts, repressor in others)
-
-### Confidence Levels
-
-| Percentile | Confidence | Interpretation |
-|------------|------------|----------------|
-| > 95% | 🟢 High | Strong effect, very confident |
-| 75-95% | 🟡 Medium | Moderate effect, reasonably confident |
-| 50-75% | 🟠 Low | Weak effect, less confident |
-| < 50% | 🔴 Very Low | Near-zero effect, likely noise |
-
----
-
-## 🆕 BRIDGE 2.0: Full Molecular Signaling Network
-
-BRIDGE 2.0 extends beyond TF→Gene to include the **complete signaling network**:
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    BRIDGE 2.0: COMPLETE SIGNALING                           │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Gene ──activates──→ Gene ──inhibits──→ TF ──upregulates──→ Gene            │
-│    ↑                   ↓                ↑                    ↓              │
-│    └───────feedback────┴────cascade────┴────expression────┘                │
-│                                                                              │
-│  NEW DATA: OmniPath Signaling                                               │
-│  • 292,000 protein-protein interactions                                     │
-│  • Gene→Gene signaling cascades                                             │
-│  • Gene→TF upstream regulation (previously unknown!)                        │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### New Edge Types:
-
-| Edge Type | Source | Direction | Example |
-|-----------|--------|-----------|---------|
-| TF→Gene | ChIP-Atlas | Expression | REST ⊣ SSTR2 |
-| TF→TF | ChIP-Atlas | Cascade | ASCL1 → NEUROD1 |
-| **Gene→Gene** | OmniPath | **Signaling** | **RAS → RAF → MEK** |
-| **Gene→TF** | OmniPath | **Upstream** | **Growth factor → TF activation** |
-
-### BRIDGE 2.0 Workflow:
-
-```bash
-# Step 1: Preprocess OmniPath signaling network
+# 1. Preprocess OmniPath signaling network
 python scripts/preprocess_omnipath.py \
     --input omnipath_all_signaling_edges.tsv \
     --output data/omnipath/ \
     --gene-list data/tf_binding/mappings.pkl
 
-# Step 2: Train full signaling model (train_v7)
+# 2. Train BRIDGE 2.0 model
 python scripts/train_v7.py \
     --singlecell data/sclc/preprocessed.h5ad \
     --tf-binding data/tf_binding/ \
     --omnipath data/omnipath/ \
     --ppi data/ppi/ \
     --output results/sclc_v7/ \
-    --epochs 100
-
-# Step 3: Discovery mode - find novel regulators!
-python scripts/discover_regulators.py \
-    --gene SSTR2 \
-    --model results/sclc_v7/ \
-    --singlecell data/sclc/preprocessed.h5ad \
-    --omnipath data/omnipath/ \
-    --output results/discovery_SSTR2/
-```
-
-### Discovery Mode 🔬
-
-Phase 2 explores **novel regulatory connections** not in known databases:
-
-```
-Phase 1: Train on known network (OmniPath + ChIP)
-         ↓
-Phase 2: Query target gene (e.g., SSTR2)
-         ↓
-         KNOWN: REST ⊣ SSTR2 (in database, high confidence)
-         LEARNED: NEUROD1 → SSTR2 (from expression data)
-         ↓
-Phase 3: DISCOVERY - Expand neighborhood
-         ↓
-         NOVEL: Gene_X → TF_Y → SSTR2 (NEW DISCOVERY!)
-         (Not in OmniPath, but supported by expression patterns)
-```
-
-**Discovery Output:**
-- `known_regulators_SSTR2.csv` - All known + learned regulators
-- `novel_discoveries_SSTR2.csv` - Novel candidates with confidence scores
-- `discovery_report_SSTR2.png` - 6-panel visualization
-
-### OmniPath Edge Weighting:
-
-Edges are weighted by number of literature references with saturation:
-
-```python
-weight = 0.5 + 0.5 * (1 - exp(-references / 10))
-
-# 0 refs → 0.5 (base weight)
-# 10 refs → 0.82
-# 50 refs → 0.99 (approaching max)
-```
-
-This prevents highly-cited edges from overwhelming less-studied connections.
-
----
-
-## Complete Workflow Example
-
-### Goal: Study SCLC Neuroendocrine Signaling
-
-```bash
-# Step 1: Train the base GRN model (once)
-python scripts/train_v6.py \
-    --singlecell data/sclc/preprocessed.h5ad \
-    --tf-binding data/tf_binding/ \
-    --ppi data/ppi/ \
-    --output results/sclc/ \
     --epochs 50
 
-# Step 2: Fine-tune for SSTR2 predictions
+# 3. Fine-tune for specific gene (SSTR2)
 python scripts/finetune_gene.py \
     --gene SSTR2 \
-    --model results/sclc/ \
+    --model results/sclc_v7/best_model.pt \
     --singlecell data/sclc/preprocessed.h5ad \
     --tf-binding data/tf_binding/ \
+    --omnipath data/omnipath/ \
     --ppi data/ppi/ \
-    --output results/sclc_SSTR2/
+    --output results/SSTR2_finetuned/ \
+    --epochs 50
 
-# Step 3: Find master regulators for NE signature
-echo -e "SSTR2\nASCL1\nNEUROD1\nCHGA\nSYP\nDLL3" > NE_genes.txt
-
-python scripts/finetune_gene.py \
-    --gene NE_genes.txt \
-    --model results/sclc/ \
+# 4. Run Nature-level evaluation
+python scripts/evaluate_nature_metrics.py \
+    --model results/sclc_v7/best_model.pt \
     --singlecell data/sclc/preprocessed.h5ad \
     --tf-binding data/tf_binding/ \
+    --omnipath data/omnipath/ \
     --ppi data/ppi/ \
-    --output results/sclc_NE_master/
-
-# Step 4: Build and test a hypothesis
-python scripts/hypothesis_builder.py  # Create in GUI, save as my_hypothesis.txt
-
-python scripts/finetune_gene.py \
-    --hypothesis my_hypothesis.txt \
-    --model results/sclc/ \
-    --singlecell data/sclc/preprocessed.h5ad \
-    --tf-binding data/tf_binding/ \
-    --ppi data/ppi/ \
-    --output results/hypothesis_test/
+    --output analysis/nature_metrics/
 ```
 
 ---
 
-## Complete Workflow
+## 💻 Installation
 
 ### Prerequisites
 
 ```bash
-# Create environment
-conda create -n grn python=3.10
-conda activate grn
+# Create conda environment
+conda create -n bridge python=3.10
+conda activate bridge
 
-# Install dependencies
+# Install PyTorch with CUDA
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install scanpy anndata numpy pandas scipy matplotlib seaborn tqdm dgl
+
+# Install DGL (Deep Graph Library)
+pip install dgl -f https://data.dgl.ai/wheels/cu118/repo.html
+
+# Install other dependencies
+pip install scanpy anndata numpy pandas scipy matplotlib seaborn tqdm networkx mygene
 ```
 
-### Step 1: Data Preparation
+### Clone Repository
 
-#### 1.1 Single-Cell RNA-seq Data
+```bash
+git clone https://github.com/arvinhm/BRIDGE.git
+cd BRIDGE/SingleCell_GRN
+```
 
-Prepare an AnnData object with:
+---
+
+## 📊 Data Preparation
+
+### Required Data Structure
+
+```
+SingleCell_GRN/
+├── data/
+│   ├── sclc/
+│   │   └── preprocessed.h5ad      # Single-cell data
+│   ├── tf_binding/
+│   │   ├── binding_matrix.npy     # (n_genes, n_tfs) TF→Gene binding
+│   │   ├── tf_tf_adjacency.npy    # (n_tfs, n_tfs) TF→TF cascade
+│   │   └── mappings.pkl           # Gene/TF name mappings
+│   ├── ppi/
+│   │   ├── cof_to_tf_adj.npy      # Cofactor→TF interactions
+│   │   ├── tf_tf_ppi.npy          # TF→TF physical interactions
+│   │   └── cofactor_gene_indices.npy
+│   └── omnipath/                   # Generated by preprocess_omnipath.py
+│       ├── gene_gene_signaling.npy
+│       ├── gene_tf_signaling.npy
+│       └── tf_tf_signaling_omnipath.npy
+```
+
+### Single-Cell Data Format
+
+Your `preprocessed.h5ad` should have:
 - `adata.X`: Log-normalized expression (cells × genes)
 - `adata.obs['celltype']`: Cell type annotations
 - `adata.var_names`: Gene symbols
 
-```python
-import scanpy as sc
+---
 
-# Load and preprocess
-adata = sc.read_h5ad('raw_data.h5ad')
-sc.pp.normalize_total(adata, target_sum=1e4)
-sc.pp.log1p(adata)
+## 📖 Step-by-Step Workflow
 
-# Aggregate to pseudo-bulk (optional, recommended for noisy data)
-# The training script can also do this automatically
-adata_pseudobulk = aggregate_to_celltype(adata, 'celltype')
-adata_pseudobulk.write('data/sclc/preprocessed.h5ad')
-```
+### Step 1: Preprocess OmniPath
 
-#### 1.2 TF Binding Data (ChIP-Atlas)
-
-Your ChIP-Atlas data should be processed into:
-
-```
-data/tf_binding/
-├── binding_matrix.npy      # (n_genes, n_tfs) - TF→Gene binding
-├── tf_tf_adjacency.npy     # (n_tfs, n_tfs) - TF→TF regulation
-└── mappings.pkl            # Gene/TF name mappings
-```
-
-**Source:** ChIP-Atlas (https://chip-atlas.org) with your `TF_pathways/` processing.
-
-### Step 2: Preprocessing
+Convert OmniPath signaling edges to adjacency matrices.
 
 ```bash
-cd SingleCell_GRN
-
-# 2a. JASPAR Motif Specificity
-# Computes how "specific" each TF's DNA motif is
-python scripts/analyze_jaspar_match.py
-# Output: data/tf_specificity/tf_specificity_weights.npy
-
-# 2b. PPI Cofactor Analysis
-# Identifies cofactor-TF relationships from Rosetta predictions
-python scripts/analyze_ppi_cofactors.py
-# Output: data/tf_specificity/tf_specificity_weights_ppi.npy
-
-# 2c. PPI Matrix Generation
-# Creates cofactor→TF and TF→TF PPI adjacency matrices
-python scripts/preprocess_ppi_rosetta.py
-# Output: data/ppi/cof_to_tf_adj.npy, data/ppi/tf_tf_ppi.npy
+python scripts/preprocess_omnipath.py \
+    --input omnipath_all_signaling_edges.tsv \
+    --output data/omnipath/ \
+    --gene-list data/tf_binding/mappings.pkl \
+    --topk-per-gene 100
 ```
 
-### Step 3: Input Validation (IMPORTANT!)
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--input` | OmniPath TSV file | **Required** |
+| `--output` | Output directory | **Required** |
+| `--gene-list` | Path to mappings.pkl for gene alignment | **Required** |
+| `--topk-per-gene` | Keep top-k edges per gene (memory control) | None (all) |
+
+**Outputs:**
+- `gene_gene_signaling.npy` - Gene→Gene signaling (activation/inhibition)
+- `gene_tf_signaling.npy` - Gene→TF upstream regulation
+- `tf_tf_signaling_omnipath.npy` - TF→TF from OmniPath
+
+---
+
+### Step 2: Train BRIDGE 2.0 Model
+
+Train the full molecular signaling network model.
 
 ```bash
-# Validates ALL input files before training
-python scripts/validate_all_inputs.py
-```
-
-This checks:
-- TF binding matrix dimensions
-- PPI matrix alignment
-- JASPAR weight ranges
-- Single-cell data structure
-- Known TF presence (NEUROD1, REST, etc.)
-
-### Step 4: Training
-
-```bash
-python scripts/train_v6.py \
+python scripts/train_v7.py \
     --singlecell data/sclc/preprocessed.h5ad \
     --tf-binding data/tf_binding/ \
-    --celltype-key sclc_subcluster \
-    --output results/sclc_grn_v6/ \
+    --omnipath data/omnipath/ \
     --ppi data/ppi/ \
-    --epochs 100 \
-    --batch-size 256 \
+    --output results/sclc_v7/ \
+    --celltype-key sclc_subcluster \
+    --epochs 50 \
+    --batch-size 512 \
     --lr 0.001 \
-    --val-every 5
+    --val-every 1
 ```
 
-#### Key Arguments
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--singlecell` | Path to h5ad file | **Required** |
+| `--tf-binding` | TF binding directory | **Required** |
+| `--omnipath` | OmniPath directory | None |
+| `--ppi` | PPI directory | None |
+| `--output` | Output directory | **Required** |
+| `--celltype-key` | Column in adata.obs | `sclc_subcluster` |
+| `--epochs` | Training epochs | 50 |
+| `--batch-size` | Batch size | 512 |
+| `--lr` | Learning rate | 0.001 |
+| `--val-every` | Validate every N epochs | 1 |
+| `--hidden-dim` | Hidden dimension | 512 |
+| `--resume` | Resume from checkpoint | None |
+| `--no-gene-propagation` | Disable Gene→Gene | False |
+| `--no-gene-tf-modulation` | Disable Gene→TF | False |
 
-| Argument | Description |
-|----------|-------------|
-| `--singlecell` | Path to preprocessed.h5ad |
-| `--tf-binding` | Directory with ChIP-Atlas data |
-| `--celltype-key` | Column name in adata.obs for cell types |
-| `--ppi` | Directory with Rosetta PPI matrices |
-| `--epochs` | Number of training epochs (100-300 recommended) |
-| `--val-every` | Validate every N epochs |
-
-#### What to Watch
-
+**What to Watch:**
 ```
-Epoch  10: loss=0.494 delta=0.938 dir_acc=0.983
-  [VAL] loss=1.19 | Delta=0.939 (LEARNING!) Dir=0.989
-  >> New best! Delta_PCC=0.9393
+Epoch  17: loss=0.3057 delta=0.963 dir=0.895
+  [VAL] Delta_PCC=0.7445 Dir_Acc=0.8955
+  >> New best! Delta_PCC=0.7445
 ```
 
-| Metric | Target | Interpretation |
-|--------|--------|----------------|
-| Delta_PCC | > 0.35 | Model learning TF effects |
-| Dir_Acc | > 65% | Correct up/down predictions |
-| Val_Loss | ↓ | Watch for overfitting |
+| Metric | Target | Meaning |
+|--------|--------|---------|
+| Delta_PCC | > 0.5 | Model learning TF effects |
+| Dir_Acc | > 85% | Correct up/down predictions |
+| Loss | ↓ | Training converging |
 
-### Step 5: Gene-Specific Fine-Tuning
+**Outputs:**
+```
+results/sclc_v7/
+├── best_model.pt              # Best checkpoint
+├── checkpoint_epoch_N.pt      # Periodic checkpoints
+├── grn_matrix_CORRECT.npy     # Learned GRN (n_genes × n_tfs)
+├── gene_names.csv             # Gene list
+├── tf_names.csv               # TF list
+├── training_history.csv       # Training curves
+└── model_config.json          # Configuration
+```
 
-For genes of particular interest, fine-tune to maximize prediction accuracy:
+---
 
-#### 5A. Single Gene Mode
+### Step 3: Fine-Tune for Specific Gene
+
+Fine-tune the model for a specific target gene (e.g., SSTR2).
 
 ```bash
 python scripts/finetune_gene.py \
     --gene SSTR2 \
-    --model results/sclc/ \
+    --model results/sclc_v7/best_model.pt \
     --singlecell data/sclc/preprocessed.h5ad \
     --tf-binding data/tf_binding/ \
+    --omnipath data/omnipath/ \
     --ppi data/ppi/ \
-    --output results/sclc_SSTR2/ \
-    --epochs 100 \
-    --batch-size 32 \
-    --hidden-dim 256
+    --output results/SSTR2_finetuned/ \
+    --epochs 50 \
+    --gene-weight 10.0 \
+    --lr 1e-4
 ```
 
-**Key Features:**
-- Uses **same architecture** as base model (IntegratedGRNModel)
-- Adds a **gene-specific refinement head**
-- **Freezes base model** - only trains refinement
-- **Cell-type holdout** - prevents data leakage
-- **Automatic analysis** - generates 4 figures at the end
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--gene` | Target gene symbol | **Required** |
+| `--model` | Pre-trained model path | **Required** |
+| `--singlecell` | Path to h5ad file | **Required** |
+| `--tf-binding` | TF binding directory | **Required** |
+| `--omnipath` | OmniPath directory | None |
+| `--ppi` | PPI directory | None |
+| `--output` | Output directory | **Required** |
+| `--epochs` | Fine-tuning epochs | 50 |
+| `--gene-weight` | Extra weight on target gene loss | 10.0 |
+| `--lr` | Learning rate | 1e-4 |
+| `--batch-size` | Batch size | 256 |
+| `--analysis-only` | Skip training, run analysis only | False |
+| `--finetuned-model` | Path to fine-tuned model (for --analysis-only) | None |
 
-#### 5B. Multi-Gene Mode (Master Regulator Discovery) 🆕
+**Outputs:**
+```
+results/SSTR2_finetuned/
+├── best_model.pt                    # Fine-tuned model
+├── grn_matrix.npy                   # Updated GRN
+├── finetune_history.csv             # Training curves
+├── finetune_config.json             # Settings
+├── SSTR2_top_gene_path_scores.csv   # Top genes → SSTR2
+├── SSTR2_top_tf_effects.csv         # Top TFs → SSTR2
+├── SSTR2_gene_sensitivity.csv       # Autograd sensitivities
+└── SSTR2_neighborhood.png           # Network visualization
+```
 
-For discovering **master regulators** that affect multiple genes of interest:
+---
+
+### Step 3b: Analysis-Only Mode
+
+If you already have a fine-tuned model, skip training and run analysis:
 
 ```bash
-# Create a text file with target genes (one per line)
-cat > genes_of_interest.txt << EOF
-SSTR2
-ASCL1
-NEUROD1
-DLL3
-CHGA
-SYP
-# Comments start with #
-EOF
-
-# Run multi-gene fine-tuning
 python scripts/finetune_gene.py \
-    --gene genes_of_interest.txt \
-    --model results/sclc/ \
+    --gene SSTR2 \
+    --model results/sclc_v7/best_model.pt \
     --singlecell data/sclc/preprocessed.h5ad \
     --tf-binding data/tf_binding/ \
+    --omnipath data/omnipath/ \
     --ppi data/ppi/ \
-    --output results/sclc_master_regulators/ \
-    --epochs 100
+    --output results/SSTR2_finetuned/ \
+    --analysis-only \
+    --finetuned-model results/SSTR2_finetuned/best_model.pt
 ```
 
-**Multi-Gene Outputs:**
+---
 
-| File | Description |
-|------|-------------|
-| `master_regulators.csv` | Ranked TFs affecting **ALL** target genes |
-| `tf_importance_<GENE>.csv` | Per-gene TF importance for each target |
-| `figure5_master_regulators.png` | Master regulator overview (10 panels) |
-| `figure6_per_gene_regulators.png` | Per-gene top TF regulators |
-| `target_genes.csv` | List of target genes analyzed |
+### Step 4: Full Target Gene Analysis
 
-**Use Cases:**
-- 🧬 Finding **pan-pathway regulators** (e.g., neuroendocrine master TFs)
-- 🎯 Identifying **therapeutic targets** affecting multiple disease genes
-- 📊 Comparing TF effects across a gene signature
-
-### Step 6: Analysis & Interpretation
-
-Analysis runs automatically after fine-tuning, or manually:
+Generate comprehensive figures and CSVs for a target gene.
 
 ```bash
 python scripts/analyze_target_full.py \
     --gene SSTR2 \
-    --model results/sclc_grn_v6/ \
+    --model results/sclc_v7 \
     --singlecell data/sclc/preprocessed.h5ad \
+    --ppi data/ppi \
+    --celltype-key sclc_subcluster \
+    --output analysis/SSTR2_full/
+```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--gene` | Target gene symbol | **Required** |
+| `--model` | Model directory | **Required** |
+| `--singlecell` | Path to h5ad file | **Required** |
+| `--ppi` | PPI directory | None |
+| `--celltype-key` | Column in adata.obs | `sclc_subcluster` |
+| `--output` | Output directory | **Required** |
+
+**Outputs:**
+```
+analysis/SSTR2_full/
+├── figure1_regulators.png           # Top activators/repressors
+├── figure2_mechanisms.png           # Regulatory mechanisms
+├── figure3_calibration.png          # Prediction validation
+├── figure4_generalizability.png     # TF consistency across cell types
+├── regulators_SSTR2.csv             # All TFs ranked
+├── interventions_SSTR2.csv          # Recommended experiments
+└── summary_SSTR2.csv                # Key statistics
+```
+
+---
+
+### Step 5: Nature-Level Evaluation
+
+Run comprehensive evaluation for publication-quality metrics.
+
+```bash
+python scripts/evaluate_nature_metrics.py \
+    --model results/sclc_v7/best_model.pt \
+    --singlecell data/sclc/preprocessed.h5ad \
+    --tf-binding data/tf_binding/ \
+    --omnipath data/omnipath/ \
     --ppi data/ppi/ \
-    --output analysis/SSTR2/
+    --output analysis/nature_metrics/
 ```
 
-#### Generated Outputs
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--model` | Model checkpoint path | **Required** |
+| `--singlecell` | Path to h5ad file | **Required** |
+| `--tf-binding` | TF binding directory | **Required** |
+| `--omnipath` | OmniPath directory | None |
+| `--ppi` | PPI directory | None |
+| `--output` | Output directory | **Required** |
+| `--celltype-key` | Column in adata.obs | `sclc_subcluster` |
 
+**Metrics Computed:**
+
+| # | Metric | Description |
+|---|--------|-------------|
+| 1 | Per-gene ΔPCC | Median, IQR, fraction >0.3/0.5/0.7 |
+| 2 | AUPRC/AUROC | Up/down classification (multiple thresholds) |
+| 3 | Ablations | -Gene→Gene, -Gene→TF, -Cofactor (with 95% CI) |
+| 4 | Held-out TF test | Generalization to unseen TFs |
+| 5 | Delta baselines | No-change, ChIP-only, OmniPath-only, Ridge |
+| 6 | Per-cell-type | Performance heatmap |
+| 7 | Calibration | ECE, slope, intercept |
+| 8 | Risk-coverage | Selective prediction curves |
+| 9 | NDCG | Ranking quality at k=10,50,100,200 |
+| 10 | Stratification | By expression variance, ChIP density |
+| 11 | Prior consistency | Edge overlap with ChIP/OmniPath |
+| 12 | Robustness | Noise σ=0.05/0.1/0.2, shuffle control |
+
+**Outputs:**
 ```
-analysis/SSTR2/
-├── figure1_regulators.png       # What regulates SSTR2?
-├── figure2_mechanisms.png       # Why these regulators?
-├── figure3_calibration.png      # Prediction validation
-├── figure4_generalizability.png # TF generalizability across cell types 🆕
-├── regulators_SSTR2.csv         # All 1480 TFs ranked
-├── interventions_SSTR2.csv      # Recommended experiments
-├── tf_generalizability_SSTR2.csv # TF consistency scores 🆕
-└── summary_SSTR2.csv            # Key statistics
-```
-
-#### Figure 4: TF Generalizability Analysis 🆕
-
-| Panel | Description |
-|-------|-------------|
-| **A-B** | UMAP/PCA of cell types colored by top activator/repressor effects |
-| **C** | Bar chart: Generalizability scores for top 20 TFs |
-| **D** | Scatter: Effect size vs Generalizability |
-| **E** | Histogram: Consistency distribution across all TFs |
-| **F** | Heatmap: Top TF effects across cell types (Z-scored) |
-| **G** | Pie chart: Universal vs Context-specific TF classification |
-| **H** | UMAP colored by target gene expression |
-| **I** | Bar chart: Best therapeutic targets (effect × generalizability) |
-| **J** | Summary statistics and recommendations |
-
-**Why Generalizability Matters:**
-- A TF with **high effect but low generalizability** may only work in specific cell types
-- A TF with **high generalizability** works consistently across patient heterogeneity
-- **Best therapeutic targets** = High effect × High generalizability!
-
----
-
-## Data Integration Summary
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        DATA SOURCES                                      │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ChIP-Atlas           JASPAR             Rosetta PPI                    │
-│  TF→Gene binding      TF motif           Cofactor→TF                    │
-│  TF→TF cascade        specificity        TF→TF physical                 │
-│       │                   │                   │                         │
-│       ▼                   ▼                   ▼                         │
-│  ┌──────────────────────────────────────────────────────────────┐       │
-│  │               IntegratedGRNModel (train_v6.py)                │       │
-│  │                                                               │       │
-│  │  • SingleCellDataEncoder (Transformer)                       │       │
-│  │  • TFRegulatoryEncoder (Cascade GCN)                         │       │
-│  │  • Context Gating (FiLM-style modulation)                    │       │
-│  │  • Cofactor Gate (PPI-based TF potency)                      │       │
-│  │  • Multi-TF Training (all TFs contribute)                    │       │
-│  │                                                               │       │
-│  └───────────────────────────┬──────────────────────────────────┘       │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌──────────────────────────────────────────────────────────────┐       │
-│  │              Single-Cell RNA-seq (Training Target)            │       │
-│  │                                                               │       │
-│  │  Cell-type differences = Virtual CRISPRa/i experiments       │       │
-│  │  Δ(TF_activity) → Δ(Gene_expression)                         │       │
-│  │                                                               │       │
-│  └──────────────────────────────────────────────────────────────┘       │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+analysis/nature_metrics/
+├── nature_metrics.json              # All metrics
+├── per_gene_metrics.csv             # Per-gene PCC, Spearman, etc.
+├── model_card.json                  # Reproducibility info
+├── nature_metrics_summary.png       # 6-panel main figure
+├── nature_metrics_diagnostics.png   # 4-panel diagnostics
+└── nature_metrics_priors.png        # 2-panel prior recovery
 ```
 
 ---
 
-## Output Interpretation
+## 📚 Script Reference
+
+### Core Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `train_v7.py` | Train BRIDGE 2.0 with full signaling network |
+| `train_v6.py` | Train base GRN model (without OmniPath) |
+| `finetune_gene.py` | Fine-tune for specific genes |
+| `evaluate_nature_metrics.py` | Comprehensive evaluation |
+| `analyze_target_full.py` | Generate analysis figures |
+
+### Preprocessing Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `preprocess_omnipath.py` | Convert OmniPath to matrices |
+| `preprocess_ppi_rosetta.py` | Process Rosetta PPI predictions |
+| `analyze_jaspar_match.py` | Compute JASPAR motif specificity |
+| `analyze_ppi_cofactors.py` | Identify cofactor-TF relationships |
+| `validate_all_inputs.py` | Validate all input files |
+
+### Discovery Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `discover_regulators.py` | Find novel regulatory connections |
+| `hypothesis_builder.py` | GUI for building pathway hypotheses |
+
+---
+
+## 🔬 BRIDGE 2.0 Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    BRIDGE 2.0: COMPLETE SIGNALING NETWORK                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Data Sources:                                                               │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
+│  │  ChIP-Atlas  │  │   JASPAR     │  │ Rosetta PPI  │  │  OmniPath    │     │
+│  │  TF→Gene     │  │  TF Motif    │  │  Cofactor    │  │  Signaling   │     │
+│  │  TF→TF       │  │  Specificity │  │  → TF        │  │  Gene→Gene   │     │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘     │
+│         │                 │                 │                 │              │
+│         ▼                 ▼                 ▼                 ▼              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                    IntegratedGRNModelV7                                 │ │
+│  │                                                                         │ │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │ │
+│  │  │ TF Cascade  │  │  Cofactor   │  │ Gene→Gene   │  │  Gene→TF    │    │ │
+│  │  │    GCN      │  │   Gating    │  │ Propagation │  │ Modulation  │    │ │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘    │ │
+│  │                          │                                              │ │
+│  │                          ▼                                              │ │
+│  │  ┌──────────────────────────────────────────────────────────────────┐  │ │
+│  │  │                  Effect Decoder + Context Gating                  │  │ │
+│  │  │                                                                   │  │ │
+│  │  │  Δ_pred = Σ_t [ effect(TF_t) × gate(context) × specificity(t) ] │  │ │
+│  │  └──────────────────────────────────────────────────────────────────┘  │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  Training Target: Single-cell RNA-seq                                        │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │  Cell Type A → Cell Type B = Virtual CRISPRa/CRISPRi experiment        │ │
+│  │  Δ(TF_activity) → Δ(Gene_expression)                                   │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📊 Output Interpretation
 
 ### GRN Matrix
 
@@ -701,9 +469,9 @@ import numpy as np
 import pandas as pd
 
 # Load
-grn = np.load('results/sclc_grn_v6/grn_matrix.npy')
-genes = pd.read_csv('results/sclc_grn_v6/gene_names.csv', header=None)[0].tolist()
-tfs = pd.read_csv('results/sclc_grn_v6/tf_names.csv', header=None)[0].tolist()
+grn = np.load('results/sclc_v7/grn_matrix_CORRECT.npy')
+genes = pd.read_csv('results/sclc_v7/gene_names.csv', header=None)[0].tolist()
+tfs = pd.read_csv('results/sclc_v7/tf_names.csv', header=None)[0].tolist()
 
 # Find SSTR2 regulators
 gene_idx = genes.index('SSTR2')
@@ -720,17 +488,17 @@ for i in top_rep_idx:
     print(f"{tfs[i]}: {effects[i]:.4f}")
 ```
 
-### Interpretation
+### Effect Interpretation
 
-| Effect Sign | Interpretation | Experiment |
-|-------------|----------------|------------|
+| Effect Sign | Interpretation | Suggested Experiment |
+|-------------|----------------|----------------------|
 | `grn[gene, tf] > 0` | TF **activates** gene | Overexpress TF → gene ↑ |
 | `grn[gene, tf] < 0` | TF **represses** gene | Knockout TF → gene ↑ |
 | `grn[gene, tf] ≈ 0` | No significant effect | Skip |
 
 ---
 
-## Troubleshooting
+## 🔧 Troubleshooting
 
 ### Training Issues
 
@@ -738,8 +506,9 @@ for i in top_rep_idx:
 |---------|-------|----------|
 | Delta_PCC stuck at 0 | Data loading issue | Check h5ad structure |
 | Delta_PCC not improving | LR too low | Increase to 0.001 |
-| GPU OOM | Batch too large | Reduce to 128 |
+| GPU OOM | Batch too large | Reduce batch-size |
 | NaN in training | LR too high | Reduce to 0.0001 |
+| `prior=0.0000` | Sparse OmniPath matrices | Normal - sparse-aware penalty |
 
 ### Fine-Tuning Issues
 
@@ -753,50 +522,45 @@ for i in top_rep_idx:
 
 ```bash
 # FileNotFoundError: best_model.pt
-# → Training didn't complete. Re-run train_v6.py
+# → Training didn't complete or used different output path
 
 # KeyError: 'sclc_subcluster'
 # → Use correct --celltype-key from your adata.obs
 
 # RuntimeError: CUDA out of memory
-# → Reduce --batch-size or use CPU with --device cpu
+# → Reduce --batch-size or use smaller --hidden-dim
+
+# DGL installation error
+# → Install DGL matching your CUDA version
 ```
 
 ---
 
-## Architecture Details
+## 📖 Documentation
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for:
-- Complete data flow diagrams
-- Model component specifications
-- GRN matrix computation formula
-- Fine-tuning architecture
-
-See [METHODS.md](METHODS.md) for:
-- Mathematical formulations
-- LINGER TF activity computation
-- Loss function components
-- Validation strategy
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** - Model architecture details
+- **[METHODS.md](METHODS.md)** - Mathematical formulations
+- **[DESIGN.md](DESIGN.md)** - Pipeline visualization
 
 ---
 
-## Citation
+## 📄 Citation
 
 ```bibtex
-@software{SingleCell-GRN,
-  title = {SingleCell-GRN: Gene Regulatory Network Inference using Virtual Perturbation Learning},
+@software{BRIDGE,
+  title = {BRIDGE: Biological Regulatory Inference via Deep Graph Encoding},
   year = {2024},
-  url = {https://github.com/xxx/SingleCell-GRN}
+  url = {https://github.com/arvinhm/BRIDGE}
 }
 ```
 
 ## References
 
-1. **LINGER**: Yuan & Duren, "Inferring gene regulatory networks from single-cell multiome data", *Nature Biotechnology* (2024)
-2. **ChIP-Atlas**: Oki et al., *EMBO Reports* (2018)
-3. **JASPAR**: Castro-Mondragon et al., *NAR* (2022)
-4. **Rosetta PPI**: Humphreys et al., *Science* (2021)
-5. **DGL**: Wang et al., *Deep Graph Library* (2019)
+1. **OmniPath**: Türei et al., "OmniPath: guidelines and gateway for literature-curated signaling pathway resources", *Nature Methods* (2021)
+2. **LINGER**: Yuan & Duren, "Inferring gene regulatory networks from single-cell multiome data", *Nature Biotechnology* (2024)
+3. **ChIP-Atlas**: Oki et al., *EMBO Reports* (2018)
+4. **JASPAR**: Castro-Mondragon et al., *NAR* (2022)
+5. **Rosetta PPI**: Humphreys et al., *Science* (2021)
 
 ---
 
