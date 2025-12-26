@@ -656,6 +656,12 @@ def main():
     parser.add_argument('--no-gene-tf-modulation', action='store_true',
                         help='Disable gene→TF modulation')
     
+    # Analysis-only mode
+    parser.add_argument('--analysis-only', action='store_true',
+                        help='Skip training, just run neighborhood analysis on existing model')
+    parser.add_argument('--finetuned-model', type=str, default=None,
+                        help='Path to fine-tuned model (for --analysis-only mode). If not provided, uses --output/best_model.pt')
+    
     args = parser.parse_args()
     
     # Setup
@@ -830,6 +836,74 @@ def main():
     
     model = model.to(device)
     print(f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # =========================================================================
+    # ANALYSIS-ONLY MODE: Skip training, go directly to analysis
+    # =========================================================================
+    if args.analysis_only:
+        print("\n" + "=" * 70)
+        print("ANALYSIS-ONLY MODE")
+        print("=" * 70)
+        
+        # Determine which model to load
+        if args.finetuned_model:
+            analysis_model_path = Path(args.finetuned_model)
+        else:
+            analysis_model_path = output_dir / 'best_model.pt'
+        
+        if analysis_model_path.exists():
+            print(f"  Loading fine-tuned model: {analysis_model_path}")
+            ft_checkpoint = torch.load(analysis_model_path, map_location='cpu', weights_only=False)
+            if 'model_state_dict' in ft_checkpoint:
+                model.load_state_dict(ft_checkpoint['model_state_dict'], strict=False)
+                print(f"  Loaded from epoch {ft_checkpoint.get('epoch', 'unknown')}")
+                print(f"  Best target PCC: {ft_checkpoint.get('best_target_pcc', 'unknown')}")
+            else:
+                model.load_state_dict(ft_checkpoint, strict=False)
+        else:
+            print(f"  No fine-tuned model found at {analysis_model_path}")
+            print(f"  Using pre-trained model from {args.model}")
+        
+        # Save GRN matrix
+        grn_matrix = model.get_grn_matrix().detach().cpu().numpy()
+        np.save(output_dir / 'grn_matrix.npy', grn_matrix)
+        print(f"  Saved: grn_matrix.npy {grn_matrix.shape}")
+        
+        # Save signaling networks
+        if hasattr(model, 'get_signaling_networks'):
+            networks = model.get_signaling_networks()
+            for name, net in networks.items():
+                if net is not None:
+                    np.save(output_dir / f'{name}.npy', net.cpu().numpy())
+                    print(f"  Saved: {name}.npy")
+        
+        # Save metadata
+        gene_names_arr = np.array(gene_names)
+        tf_names_arr = np.array(tf_names)
+        
+        pd.DataFrame({'gene': gene_names}).to_csv(
+            output_dir / 'gene_names.csv', index=False, header=False
+        )
+        pd.DataFrame({'tf': tf_names}).to_csv(
+            output_dir / 'tf_names.csv', index=False, header=False
+        )
+        
+        # Run neighborhood analysis
+        run_neighborhood_analysis(
+            model=model,
+            target_gene=target_gene,
+            target_gene_idx=target_gene_idx,
+            gene_names=gene_names_arr,
+            tf_names=tf_names_arr,
+            expression=expression,
+            output_dir=output_dir
+        )
+        
+        print("\n" + "=" * 70)
+        print("ANALYSIS COMPLETE!")
+        print("=" * 70)
+        print(f"Output saved to: {output_dir}")
+        return
     
     # =========================================================================
     # GRADIENT MASKING: Only update target gene's direct_effects row
