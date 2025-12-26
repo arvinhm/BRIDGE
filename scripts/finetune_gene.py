@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-BRIDGE 2.0: GENE-SPECIFIC FINE-TUNING
+BRIDGE 2.0: GENE-SPECIFIC FINE-TUNING WITH NEIGHBORHOOD ANALYSIS
 ================================================================================
 
 USES EXACTLY the same architecture as train_v7.py:
@@ -13,8 +13,9 @@ USES EXACTLY the same architecture as train_v7.py:
 
 ADDS:
 - Extra loss weight on target gene
-- Freezes TF identity (embeddings, cascade)
+- Freezes TF identity (embeddings, cascade, specificity weights)
 - Only tunes gene-level effects
+- Neighborhood analysis: Gene→TF→Target path scoring
 
 Usage:
     python scripts/finetune_gene.py \
@@ -65,8 +66,6 @@ from scripts.train_v7 import (
     
     # OmniPath loading
     load_omnipath,
-    _expand_gene_matrix,
-    _expand_gene_tf_matrix,
     
     # Model - THE v7 ARCHITECTURE with Gene→Gene, Gene→TF
     IntegratedGRNModelV7,
@@ -132,13 +131,11 @@ class GeneWeightedLoss(DeltaFocusedLoss):
         # Target gene MSE (weighted extra)
         target_mse = F.mse_loss(target_pred, target_actual)
         
-        # Target gene correlation
-        pred_centered = target_pred - target_pred.mean()
-        actual_centered = target_actual - target_actual.mean()
+        # Target gene correlation - numerically stable formula
+        pred_c = target_pred - target_pred.mean()
+        actual_c = target_actual - target_actual.mean()
         
-        numerator = (pred_centered * actual_centered).sum()
-        denominator = (pred_centered.std() * actual_centered.std() * len(target_pred)) + 1e-8
-        correlation = numerator / denominator
+        correlation = (pred_c * actual_c).mean() / (pred_c.std() * actual_c.std() + 1e-8)
         correlation = torch.clamp(correlation, -1, 1)
         
         # Target gene direction accuracy
@@ -183,6 +180,7 @@ class GeneSpecificTrainer(SignalingGRNTrainer):
         prior_penalty_weight: float = 0.01
     ):
         # Call parent constructor (SignalingGRNTrainer -> IntegratedGRNTrainer)
+        # Note: SignalingGRNTrainer stores prior_penalty_weight itself
         super().__init__(
             model=model,
             device=device,
@@ -227,6 +225,7 @@ class GeneSpecificTrainer(SignalingGRNTrainer):
         pbar = tqdm(dataloader, desc=f"Epoch {epoch:3d}")
         
         for batch in pbar:
+            # Correct keys from MultiTFDataset (train_v6/v7)
             tf_change = batch['tf_activity_change'].to(self.device)
             source_expr = batch['source_expression'].to(self.device)
             actual_delta = batch['delta_expression'].to(self.device)
@@ -241,7 +240,7 @@ class GeneSpecificTrainer(SignalingGRNTrainer):
                 
                 losses = self.loss_fn(pred_delta, actual_delta)
                 
-                # Add L2 prior penalty (from SignalingGRNTrainer)
+                # Add L2 prior penalty (inherited from SignalingGRNTrainer)
                 prior_penalty = self.compute_prior_penalty()
                 total_loss_batch = losses['total'] + prior_penalty
             
@@ -367,6 +366,235 @@ class GeneSpecificTrainer(SignalingGRNTrainer):
 
 
 # =============================================================================
+# NEIGHBORHOOD ANALYSIS
+# =============================================================================
+
+def run_neighborhood_analysis(
+    model: IntegratedGRNModelV7,
+    target_gene: str,
+    target_gene_idx: int,
+    gene_names: np.ndarray,
+    tf_names: np.ndarray,
+    expression: np.ndarray,
+    output_dir: Path,
+    top_k: int = 20
+):
+    """
+    Compute neighborhood analysis: Gene→TF→Target path scores and sensitivity.
+    
+    Produces:
+    1. CSV of top Gene→TF→Target path contributors
+    2. CSV of local gene sensitivities (autograd)
+    3. Network visualization showing which genes (via which TFs) affect target
+    """
+    print("\n" + "=" * 70)
+    print(f"NEIGHBORHOOD ANALYSIS FOR {target_gene}")
+    print("=" * 70)
+    
+    device = next(model.parameters()).device
+    model.eval()
+    
+    # Get GRN matrix
+    with torch.no_grad():
+        grn = model.get_grn_matrix().cpu().numpy()  # (n_genes, n_tfs)
+    
+    print(f"  GRN matrix: {grn.shape}")
+    
+    # Get Gene→TF modulation matrix if available
+    gene_to_tf = None
+    if getattr(model, 'use_gene_tf_modulation', False):
+        with torch.no_grad():
+            # Combine learned and prior: gene_to_tf is (n_tfs, n_genes)
+            g2t_learned = model.gene_to_tf.cpu().numpy()
+            g2t_prior = model.gene_tf_prior.T.cpu().numpy()
+            gene_to_tf = (g2t_learned + 0.5 * g2t_prior).T  # -> (n_genes, n_tfs)
+        print(f"  Gene→TF matrix: {gene_to_tf.shape}")
+    
+    # =========================================================================
+    # 1. Path Scores: Gene→TF→Target
+    # =========================================================================
+    print("\n  [1/3] Computing Gene→TF→Target path scores...")
+    
+    if gene_to_tf is not None:
+        # TF effects on target gene
+        tf_target = grn[target_gene_idx, :]  # (n_tfs,) - signed effects
+        tf_target_abs = np.abs(tf_target)
+        
+        # Path scores: how much does each gene affect target via each TF
+        # path_score[g, t] = |gene_to_tf[g, t]| × |grn[target, t]|
+        path_scores = np.abs(gene_to_tf) * tf_target_abs[None, :]  # (n_genes, n_tfs)
+        
+        # Aggregate: total path score per gene
+        gene_path_scores = np.nansum(path_scores, axis=1)  # (n_genes,)
+        
+        # Top genes by path score
+        top_gene_idx = np.argsort(gene_path_scores)[-top_k:][::-1]
+        top_tfs_idx = np.argsort(tf_target_abs)[-top_k:][::-1]
+        
+        # Save top genes
+        path_df = pd.DataFrame({
+            'gene': gene_names[top_gene_idx],
+            'path_score': gene_path_scores[top_gene_idx],
+            'gene_idx': top_gene_idx
+        })
+        path_df.to_csv(output_dir / f'{target_gene}_top_gene_path_scores.csv', index=False)
+        print(f"    Saved: {target_gene}_top_gene_path_scores.csv")
+        
+        # Save top TFs affecting target
+        tf_df = pd.DataFrame({
+            'tf': tf_names[top_tfs_idx],
+            'effect_on_target': tf_target[top_tfs_idx],
+            'tf_idx': top_tfs_idx
+        })
+        tf_df.to_csv(output_dir / f'{target_gene}_top_tf_effects.csv', index=False)
+        print(f"    Saved: {target_gene}_top_tf_effects.csv")
+    else:
+        print("    Gene→TF modulation not available, skipping path analysis")
+        top_gene_idx = np.arange(min(top_k, len(gene_names)))
+        top_tfs_idx = np.argsort(np.abs(grn[target_gene_idx, :]))[-top_k:][::-1]
+        path_scores = None
+    
+    # =========================================================================
+    # 2. Local Sensitivity via Autograd
+    # =========================================================================
+    print("\n  [2/3] Computing gene sensitivity via autograd...")
+    
+    # Representative TF change: mean abs across dataset
+    tf_change_ref = torch.ones(1, grn.shape[1], device=device)
+    
+    # Representative source expression: mean across cell types
+    source_expr_ref = torch.from_numpy(expression.mean(axis=0)).float().unsqueeze(0).to(device)
+    source_expr_ref.requires_grad_(True)
+    
+    # Forward pass with gradient tracking
+    model.eval()
+    pred_delta, _ = model.predict_delta_multi_tf(tf_change_ref, source_expr_ref)
+    target_delta = pred_delta[0, target_gene_idx]
+    
+    # Backward to get sensitivity
+    target_delta.backward()
+    gene_sensitivity = source_expr_ref.grad.detach().cpu().numpy().ravel()
+    
+    # Save sensitivity
+    sens_df = pd.DataFrame({
+        'gene': gene_names,
+        'sensitivity': gene_sensitivity
+    }).sort_values('sensitivity', key=abs, ascending=False)
+    sens_df.to_csv(output_dir / f'{target_gene}_gene_sensitivity.csv', index=False)
+    print(f"    Saved: {target_gene}_gene_sensitivity.csv")
+    
+    # =========================================================================
+    # 3. Neighborhood Graph Visualization
+    # =========================================================================
+    print("\n  [3/3] Creating neighborhood graph...")
+    
+    try:
+        import networkx as nx
+        import matplotlib.pyplot as plt
+        
+        G = nx.DiGraph()
+        
+        # Target node
+        G.add_node(target_gene, kind='target')
+        
+        # Add top gene nodes
+        for gi in top_gene_idx[:top_k]:
+            g_name = gene_names[gi]
+            if g_name != target_gene:
+                G.add_node(g_name, kind='gene')
+        
+        # Add top TF nodes
+        for ti in top_tfs_idx[:top_k]:
+            G.add_node(tf_names[ti], kind='tf')
+        
+        # Add edges: Gene→TF (weighted by path contribution)
+        if path_scores is not None:
+            # Threshold: keep only top edges
+            threshold = np.percentile(np.abs(path_scores[path_scores != 0]), 95)
+            
+            for gi in top_gene_idx[:top_k]:
+                g_name = gene_names[gi]
+                if g_name == target_gene:
+                    continue
+                for ti in top_tfs_idx[:top_k]:
+                    t_name = tf_names[ti]
+                    w = gene_to_tf[gi, ti]
+                    if abs(w) > threshold * 0.1:  # Keep stronger edges
+                        G.add_edge(g_name, t_name, weight=w, role='gene->tf')
+        
+        # Add edges: TF→Target
+        for ti in top_tfs_idx[:top_k]:
+            t_name = tf_names[ti]
+            w = grn[target_gene_idx, ti]
+            if abs(w) > 0.001:  # Non-trivial effect
+                G.add_edge(t_name, target_gene, weight=w, role='tf->target')
+        
+        # Layout
+        pos = nx.kamada_kawai_layout(G)
+        
+        # Edge styling
+        edge_colors = []
+        edge_widths = []
+        max_weight = max(abs(d.get('weight', 0.1)) for _, _, d in G.edges(data=True)) + 1e-8
+        for u, v, d in G.edges(data=True):
+            if d.get('role') == 'gene->tf':
+                edge_colors.append('#2ca02c' if d.get('weight', 0) > 0 else '#d62728')
+            else:
+                edge_colors.append('#1f77b4' if d.get('weight', 0) > 0 else '#ff7f0e')
+            edge_widths.append(max(0.5, 3.0 * abs(d.get('weight', 0.1)) / max_weight))
+        
+        # Node styling
+        node_colors = []
+        for n, d in G.nodes(data=True):
+            kind = d.get('kind', 'gene')
+            if kind == 'target':
+                node_colors.append('#fb8072')
+            elif kind == 'tf':
+                node_colors.append('#bebada')
+            else:
+                node_colors.append('#8dd3c7')
+        
+        # Draw
+        plt.figure(figsize=(14, 10))
+        nx.draw_networkx(
+            G, pos,
+            with_labels=True,
+            node_size=800,
+            node_color=node_colors,
+            arrows=True,
+            width=edge_widths,
+            edge_color=edge_colors,
+            font_size=8,
+            font_weight='bold',
+            arrowsize=15
+        )
+        
+        plt.title(f'{target_gene} Neighborhood: Gene→TF→Target Routes (post-finetune)', fontsize=14)
+        
+        # Legend
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='#fb8072', label='Target Gene'),
+            Patch(facecolor='#bebada', label='TFs'),
+            Patch(facecolor='#8dd3c7', label='Upstream Genes'),
+        ]
+        plt.legend(handles=legend_elements, loc='upper left')
+        
+        plt.axis('off')
+        plt.tight_layout()
+        plt.savefig(output_dir / f'{target_gene}_neighborhood.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"    Saved: {target_gene}_neighborhood.png")
+        print(f"    Graph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+        
+    except ImportError as e:
+        print(f"    Skipping graph visualization (missing dependency: {e})")
+    
+    print("\n  Neighborhood analysis complete!")
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -470,6 +698,7 @@ def main():
     # =========================================================================
     print("\n[4/7] Loading OmniPath signaling network...")
     if args.omnipath:
+        # load_omnipath signature: (omnipath_dir, n_genes, n_tfs, gene_names, tf_names)
         gene_gene, gene_tf, tf_tf_omnipath = load_omnipath(
             args.omnipath, len(gene_names), len(tf_names),
             gene_names=gene_names, tf_names=tf_names
@@ -596,12 +825,12 @@ def main():
     trainable_count = 0
     
     for name, param in model.named_parameters():
-        # FREEZE: TF embeddings, cascade, and gene propagation/modulation
+        # FREEZE: TF embeddings, cascade, specificity weights, and global network params
         # These represent learned TF relationships we want to preserve
         if any(x in name for x in [
-            'tf_embeddings', 'tf_cascade',
+            'tf_embeddings', 'tf_cascade', 'tf_specificity_weights',
             'gene_propagation', 'gene_to_tf', 'gene_prop_weight',
-            'gene_tf_modulation_strength'
+            'gene_tf_modulation_strength', 'gene_gene_prior', 'gene_tf_prior'
         ]):
             param.requires_grad = False
             frozen_count += 1
@@ -717,6 +946,9 @@ def main():
                 print(f"  Saved: {name}.npy")
     
     # Save metadata
+    gene_names_arr = np.array(gene_names)
+    tf_names_arr = np.array(tf_names)
+    
     pd.DataFrame({'gene': gene_names}).to_csv(
         output_dir / 'gene_names.csv', index=False, header=False
     )
@@ -750,6 +982,19 @@ def main():
     
     print(f"\nBest: Epoch {best_epoch} with {target_gene}_PCC={best_target_pcc:.4f}")
     print(f"Saved to: {output_dir}")
+    
+    # =========================================================================
+    # NEIGHBORHOOD ANALYSIS
+    # =========================================================================
+    run_neighborhood_analysis(
+        model=model,
+        target_gene=target_gene,
+        target_gene_idx=target_gene_idx,
+        gene_names=gene_names_arr,
+        tf_names=tf_names_arr,
+        expression=expression,
+        output_dir=output_dir
+    )
     
     # =========================================================================
     # DONE
